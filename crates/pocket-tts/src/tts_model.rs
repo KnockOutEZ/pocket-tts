@@ -1145,7 +1145,7 @@ impl TTSModel {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_with_alignment(variant: &str) -> Result<Self> {
         let mut model = Self::load(variant)?;
-        let aligner = crate::alignment::WhisperAligner::load()?;
+        let aligner = crate::alignment::WhisperAligner::load(&model.device)?;
         model.aligner = Some(aligner);
         Ok(model)
     }
