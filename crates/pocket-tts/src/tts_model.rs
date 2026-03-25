@@ -48,7 +48,7 @@ pub struct TTSModel {
     pub device: Device,
     /// Optional alignment model for word timestamps
     #[cfg(not(target_arch = "wasm32"))]
-    pub aligner: Option<crate::alignment::Wav2Vec2Aligner>,
+    pub aligner: Option<crate::alignment::WhisperAligner>,
 }
 
 /// Result of generation with word-level timestamps.
@@ -1145,7 +1145,7 @@ impl TTSModel {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_with_alignment(variant: &str) -> Result<Self> {
         let mut model = Self::load(variant)?;
-        let aligner = crate::alignment::Wav2Vec2Aligner::load(&model.device)?;
+        let aligner = crate::alignment::WhisperAligner::load()?;
         model.aligner = Some(aligner);
         Ok(model)
     }

@@ -1,89 +1,138 @@
-use crate::alignment::forced_align::{
-    WordTimestamp, text_to_ctc_targets, viterbi_forced_align, path_to_word_timestamps,
-};
-use crate::alignment::wav2vec2::Wav2Vec2Model;
+//! Whisper-based speech aligner for word-level timestamps.
+//!
+//! Shells out to the `whisper` CLI for transcription with word timestamps.
+//! Requires `whisper` (OpenAI) installed: `pip install openai-whisper`
+
+use crate::alignment::forced_align::WordTimestamp;
 use crate::audio::resample;
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
+use std::process::Command;
 
 const TTS_SAMPLE_RATE: u32 = 24000;
-const WAV2VEC2_SAMPLE_RATE: u32 = 16000;
+const WHISPER_SAMPLE_RATE: u32 = 16000;
 
+/// Speech aligner using Whisper CLI for word-level timestamps.
 #[derive(Clone)]
-pub struct Wav2Vec2Aligner {
-    model: Wav2Vec2Model,
-    device: Device,
+pub struct WhisperAligner {
+    model: String,
 }
 
-impl Wav2Vec2Aligner {
-    pub fn load(device: &Device) -> anyhow::Result<Self> {
-        let model = Wav2Vec2Model::load(device)?;
-        Ok(Self { model, device: device.clone() })
+impl WhisperAligner {
+    /// Create aligner with specified Whisper model size.
+    pub fn new(model: &str) -> Self {
+        Self { model: model.to_string() }
     }
 
-    pub fn align(&self, audio: &Tensor, text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
-        // 1. Build CTC targets from text
-        let (targets, word_spans) = text_to_ctc_targets(text);
-        if targets.is_empty() {
-            return Ok(Vec::new());
+    /// Create aligner with default model (base.en — fast + accurate on English).
+    pub fn load() -> anyhow::Result<Self> {
+        // Verify whisper is installed
+        let check = Command::new("whisper").arg("--help").output();
+        if check.is_err() {
+            anyhow::bail!(
+                "Whisper CLI not found. Install with: pip install openai-whisper"
+            );
         }
+        Ok(Self::new("base.en"))
+    }
 
-        // 2. Prepare audio: ensure [1, T], resample 24kHz → 16kHz, normalize
+    /// Align audio to produce word-level timestamps.
+    ///
+    /// `audio`: Tensor [C, T] at 24kHz (TTS output)
+    /// `_text`: Original text (unused — Whisper transcribes freely)
+    pub fn align(&self, audio: &Tensor, _text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
+        // 1. Prepare audio: mono 16kHz WAV in temp file
         let audio = match audio.dims().len() {
-            1 => audio.unsqueeze(0)?,                     // [T] → [1, T]
-            2 if audio.dims()[0] == 1 => audio.clone(),   // [1, T]
-            2 => audio.mean(0)?.unsqueeze(0)?,            // [C, T] → mono → [1, T]
+            1 => audio.unsqueeze(0)?,
+            2 if audio.dims()[0] == 1 => audio.clone(),
+            2 => audio.mean(0)?.unsqueeze(0)?,
             _ => anyhow::bail!("Unexpected audio shape: {:?}", audio.dims()),
         };
 
-        let audio_16k = resample(&audio, TTS_SAMPLE_RATE, WAV2VEC2_SAMPLE_RATE)?;
+        let audio_16k = resample(&audio, TTS_SAMPLE_RATE, WHISPER_SAMPLE_RATE)?;
+        let samples = audio_16k.flatten_all()?.to_vec1::<f32>()?;
 
-        // Normalize: zero mean, unit variance (wav2vec2 convention)
-        let mean = audio_16k.mean_all()?;
-        let centered = audio_16k.broadcast_sub(&mean)?;
-        let var = (&centered * &centered)?.mean_all()?;
-        let std = (var + 1e-7)?.sqrt()?;
-        let normalized = centered.broadcast_div(&std)?;
+        // Write temp WAV
+        let tmp_dir = std::env::temp_dir();
+        let wav_path = tmp_dir.join("pocket_tts_align.wav");
+        let json_dir = tmp_dir.join("pocket_tts_whisper");
+        std::fs::create_dir_all(&json_dir)?;
 
-        // Move to model device if needed
-        let normalized = if !normalized.device().same_device(&self.device) {
-            normalized.to_device(&self.device)?
-        } else {
-            normalized
-        };
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: WHISPER_SAMPLE_RATE,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&wav_path, spec)?;
+            for &s in &samples {
+                writer.write_sample((s * 32767.0).clamp(-32768.0, 32767.0) as i16)?;
+            }
+            writer.finalize()?;
+        }
 
-        // 3. Forward pass: [1, 1, samples] → [1, frames, 32]
-        let input = normalized.unsqueeze(0)?;
-        let log_probs = self.model.forward(&input)?;
+        // 2. Run Whisper CLI
+        let output = Command::new("whisper")
+            .arg(wav_path.to_str().unwrap())
+            .arg("--model").arg(&self.model)
+            .arg("--language").arg("en")
+            .arg("--word_timestamps").arg("True")
+            .arg("--output_format").arg("json")
+            .arg("--output_dir").arg(json_dir.to_str().unwrap())
+            .output()?;
 
-        // 4. Extract as Vec<Vec<f32>> for Viterbi
-        let log_probs_2d = log_probs.squeeze(0)?; // [frames, 32]
-        let flat = log_probs_2d.to_vec2::<f32>()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Whisper failed: {}", stderr);
+        }
 
-        // 5. Viterbi forced alignment
-        let path = viterbi_forced_align(&flat, &targets)?;
+        // 3. Parse JSON output
+        let json_path = json_dir.join("pocket_tts_align.json");
+        let json_str = std::fs::read_to_string(&json_path)?;
+        let json: serde_json::Value = serde_json::from_str(&json_str)?;
 
-        // 6. Convert to word timestamps
-        Ok(path_to_word_timestamps(&path, &targets, &word_spans))
+        let mut timestamps = Vec::new();
+
+        if let Some(segments) = json.get("segments").and_then(|s| s.as_array()) {
+            for seg in segments {
+                if let Some(words) = seg.get("words").and_then(|w| w.as_array()) {
+                    for w in words {
+                        let word = w.get("word")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let start = w.get("start")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0) as f32;
+                        let end = w.get("end")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0) as f32;
+
+                        if !word.is_empty() {
+                            timestamps.push(WordTimestamp { word, start_sec: start, end_sec: end });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cleanup temp files
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_dir_all(&json_dir);
+
+        Ok(timestamps)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
+    use candle_core::{DType, Device};
 
     #[test]
-    #[ignore] // requires ~90MB model download
-    fn test_aligner_on_silence() {
-        let device = Device::Cpu;
-        let aligner = Wav2Vec2Aligner::load(&device).unwrap();
-
-        // 1 second of silence at 24kHz
-        let audio = Tensor::zeros((1, 24000), DType::F32, &device).unwrap();
-        let timestamps = aligner.align(&audio, "hello world").unwrap();
-
-        assert_eq!(timestamps.len(), 2);
-        assert_eq!(timestamps[0].word, "hello");
-        assert_eq!(timestamps[1].word, "world");
+    #[ignore] // requires whisper CLI installed
+    fn test_whisper_aligner_loads() {
+        let _aligner = WhisperAligner::load().unwrap();
     }
 }

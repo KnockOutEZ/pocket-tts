@@ -15,7 +15,7 @@ pub mod wasm;
 
 pub use alignment::WordTimestamp;
 #[cfg(not(target_arch = "wasm32"))]
-pub use alignment::Wav2Vec2Aligner;
+pub use alignment::WhisperAligner;
 pub use pause::{ParsedText, PauseMarker, parse_text_with_pauses};
 pub use quantize::{QuantizeConfig, QuantizedTensor};
 pub use tts_model::GenerationResult;
