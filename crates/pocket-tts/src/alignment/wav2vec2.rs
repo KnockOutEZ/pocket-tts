@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{
-    conv1d, conv1d_no_bias, group_norm, layer_norm, linear, Conv1d, Conv1dConfig, GroupNorm,
+    conv1d_no_bias, group_norm, layer_norm, linear, Conv1d, Conv1dConfig, GroupNorm,
     LayerNorm, Linear, Module, VarBuilder,
 };
 
@@ -145,13 +145,43 @@ struct PosConvEmbed {
 
 impl PosConvEmbed {
     fn load(vb: VarBuilder) -> Result<Self> {
+        // The positional conv in wav2vec2-base-960h uses PyTorch weight
+        // normalization, so the safetensors file stores `weight_g` and
+        // `weight_v` instead of a plain `weight` tensor.  We reconstruct
+        // the effective weight here:
+        //   weight = weight_g * weight_v / ||weight_v||_2
+        let pos_vb = vb.pp("conv");
+
+        let weight_g = pos_vb
+            .get((1, 1, POS_CONV_KERNEL), "weight_g")
+            .context("loading pos_conv_embed weight_g")?;
+        let weight_v = pos_vb
+            .get(
+                (HIDDEN_SIZE, HIDDEN_SIZE / POS_CONV_GROUPS, POS_CONV_KERNEL),
+                "weight_v",
+            )
+            .context("loading pos_conv_embed weight_v")?;
+        let bias = pos_vb
+            .get(HIDDEN_SIZE, "bias")
+            .context("loading pos_conv_embed bias")?;
+
+        // L2 norm of weight_v over dims [0, 1], keepdim -> [1, 1, kernel]
+        let norm = weight_v
+            .sqr()?
+            .sum_keepdim((0usize, 1usize))?
+            .sqrt()
+            .context("computing weight_v L2 norm")?;
+        let weight = weight_v
+            .broadcast_mul(&weight_g)?
+            .broadcast_div(&norm)
+            .context("reconstructing weight-normed conv weight")?;
+
         let cfg = Conv1dConfig {
             padding: POS_CONV_KERNEL / 2, // 64
             groups: POS_CONV_GROUPS,
             ..Default::default()
         };
-        let conv = conv1d(HIDDEN_SIZE, HIDDEN_SIZE, POS_CONV_KERNEL, cfg, vb.pp("conv"))
-            .context("loading pos_conv_embed conv")?;
+        let conv = Conv1d::new(weight, Some(bias), cfg);
         Ok(Self { conv })
     }
 
