@@ -18,5 +18,6 @@ pub use alignment::WordTimestamp;
 pub use alignment::Wav2Vec2Aligner;
 pub use pause::{ParsedText, PauseMarker, parse_text_with_pauses};
 pub use quantize::{QuantizeConfig, QuantizedTensor};
+pub use tts_model::GenerationResult;
 pub use tts_model::TTSModel;
 pub use voice_state::ModelState;

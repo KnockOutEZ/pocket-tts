@@ -46,6 +46,15 @@ pub struct TTSModel {
     pub ldim: usize,
     /// Device
     pub device: Device,
+    /// Optional alignment model for word timestamps
+    #[cfg(not(target_arch = "wasm32"))]
+    pub aligner: Option<crate::alignment::Wav2Vec2Aligner>,
+}
+
+/// Result of generation with word-level timestamps.
+pub struct GenerationResult {
+    pub audio: Tensor,
+    pub word_timestamps: Vec<crate::alignment::WordTimestamp>,
 }
 
 impl TTSModel {
@@ -422,6 +431,8 @@ impl TTSModel {
             dim,
             ldim,
             device,
+            #[cfg(not(target_arch = "wasm32"))]
+            aligner: None,
         })
     }
 
@@ -1128,6 +1139,82 @@ impl TTSModel {
     pub fn estimate_generation_steps(&self, text: &str) -> usize {
         let prepared = prepare_text_prompt(text);
         (prepared.split_whitespace().count() + 2) * 13
+    }
+
+    /// Load TTS model + alignment model together
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_with_alignment(variant: &str) -> Result<Self> {
+        let mut model = Self::load(variant)?;
+        let aligner = crate::alignment::Wav2Vec2Aligner::load(&model.device)?;
+        model.aligner = Some(aligner);
+        Ok(model)
+    }
+
+    /// Generate audio for a single sentence with word timestamps.
+    /// No internal text splitting -- caller controls chunking.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn generate_sentence_with_timestamps(
+        &self,
+        sentence: &str,
+        voice_state: &ModelState,
+    ) -> Result<GenerationResult> {
+        let aligner = self.aligner.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Alignment model not loaded. Use load_with_alignment()"))?;
+
+        let audio = self.generate(sentence, voice_state)?;
+        let word_timestamps = aligner.align(&audio, sentence)?;
+
+        Ok(GenerationResult { audio, word_timestamps })
+    }
+
+    /// Generate audio with word timestamps for full text.
+    /// Splits text into sentences internally, generates + aligns each.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn generate_with_timestamps(
+        &self,
+        text: &str,
+        voice_state: &ModelState,
+    ) -> Result<GenerationResult> {
+        let aligner = self.aligner.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Alignment model not loaded. Use load_with_alignment()"))?;
+
+        let chunks = self.split_into_best_sentences(text);
+
+        if chunks.is_empty() {
+            anyhow::bail!("No text to generate");
+        }
+
+        let mut all_audio = Vec::new();
+        let mut all_timestamps = Vec::new();
+        let mut cumulative_offset_sec: f32 = 0.0;
+
+        for chunk_text in &chunks {
+            let audio = self.generate(chunk_text, voice_state)?;
+
+            let mut timestamps = aligner.align(&audio, chunk_text)?;
+            for ts in &mut timestamps {
+                ts.start_sec += cumulative_offset_sec;
+                ts.end_sec += cumulative_offset_sec;
+            }
+
+            // Duration from actual sample count
+            let num_samples = audio.dims().last().copied().unwrap_or(0);
+            cumulative_offset_sec += num_samples as f32 / self.sample_rate as f32;
+
+            all_audio.push(audio);
+            all_timestamps.extend(timestamps);
+        }
+
+        let audio = if all_audio.len() == 1 {
+            all_audio.into_iter().next().unwrap()
+        } else {
+            Tensor::cat(&all_audio, 1)?
+        };
+
+        Ok(GenerationResult {
+            audio,
+            word_timestamps: all_timestamps,
+        })
     }
 }
 
