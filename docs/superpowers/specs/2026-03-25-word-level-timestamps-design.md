@@ -107,7 +107,7 @@ Linear 512 → 768 with layer norm. Projects CNN features to transformer dimensi
 
 ### Positional Encoding
 
-Convolutional position embedding: grouped Conv1d (128 groups, kernel 128, padding 64) on the projected features. This is NOT RoPE — it's a learned convolutional positional encoding specific to wav2vec2.
+Convolutional position embedding: grouped Conv1d (16 groups, kernel 128, padding 64) on the projected features. This is NOT RoPE — it's a learned convolutional positional encoding specific to wav2vec2.
 
 ### Transformer Encoder
 
