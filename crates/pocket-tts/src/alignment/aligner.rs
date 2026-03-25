@@ -16,7 +16,7 @@ use tokenizers::Tokenizer;
 
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
-const WHISPER_REPO: &str = "openai/whisper-tiny.en";
+const WHISPER_REPO: &str = "openai/whisper-base.en";
 
 // Mel filter bank (80 bins x 201 freq bins), extracted from OpenAI Whisper.
 const MEL_FILTERS: &[u8] = include_bytes!("melfilters.bytes");
