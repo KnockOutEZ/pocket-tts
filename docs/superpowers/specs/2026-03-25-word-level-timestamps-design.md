@@ -44,9 +44,19 @@ impl TTSModel {
     pub fn load_with_alignment(variant: &str) -> Result<Self>;
 
     /// Generate audio with word timestamps (batch, non-streaming)
+    /// Splits text into sentences internally, generates + aligns each.
     pub fn generate_with_timestamps(
         &self,
         text: &str,
+        voice_state: &ModelState,
+    ) -> Result<GenerationResult>;
+
+    /// Generate + align a single pre-split sentence.
+    /// No internal text splitting — caller controls chunking.
+    /// Use this when the product already splits sentences itself.
+    pub fn generate_sentence_with_timestamps(
+        &self,
+        sentence: &str,
         voice_state: &ModelState,
     ) -> Result<GenerationResult>;
 }
