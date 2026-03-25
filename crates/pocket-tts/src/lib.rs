@@ -1,3 +1,4 @@
+pub mod alignment;
 pub mod audio;
 pub mod conditioners;
 pub mod config;
@@ -12,6 +13,9 @@ pub mod weights;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
+pub use alignment::WordTimestamp;
+#[cfg(not(target_arch = "wasm32"))]
+pub use alignment::Wav2Vec2Aligner;
 pub use pause::{ParsedText, PauseMarker, parse_text_with_pauses};
 pub use quantize::{QuantizeConfig, QuantizedTensor};
 pub use tts_model::TTSModel;
