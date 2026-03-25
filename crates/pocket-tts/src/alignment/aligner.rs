@@ -127,6 +127,13 @@ impl WhisperAligner {
         let max_tokens = self.config.max_target_positions / 2;
         let timestamp_begin = self.no_timestamps_token + 1;
 
+        // Track text tokens since last timestamp to force shorter segments.
+        // After MAX_TEXT_TOKENS_PER_SEGMENT text tokens, bias heavily toward
+        // timestamp tokens so each segment is ~1-2 words.
+        const MAX_TEXT_TOKENS_PER_SEGMENT: usize = 2; // ~1 word
+        const TIMESTAMP_BIAS: f32 = 8.0; // very strong bias toward emitting timestamp
+        let mut text_tokens_since_timestamp: usize = 0;
+
         for i in 0..max_tokens {
             let tokens_tensor = Tensor::new(tokens.as_slice(), &self.device)?
                 .unsqueeze(0)?;
@@ -139,9 +146,16 @@ impl WhisperAligner {
 
             // Apply suppress mask
             let logits = logits.broadcast_add(&self.suppress_tokens)?;
+            let mut logits_vec: Vec<f32> = logits.to_vec1()?;
+
+            // Bias toward timestamp tokens when segment is getting long
+            if text_tokens_since_timestamp >= MAX_TEXT_TOKENS_PER_SEGMENT {
+                for tok_id in (timestamp_begin as usize)..logits_vec.len() {
+                    logits_vec[tok_id] += TIMESTAMP_BIAS;
+                }
+            }
 
             // Greedy: argmax
-            let logits_vec: Vec<f32> = logits.to_vec1()?;
             let next_token = logits_vec
                 .iter()
                 .enumerate()
@@ -150,6 +164,12 @@ impl WhisperAligner {
                 .unwrap_or(self.eot_token);
 
             tokens.push(next_token);
+
+            if next_token >= timestamp_begin {
+                text_tokens_since_timestamp = 0;
+            } else if next_token != self.eot_token {
+                text_tokens_since_timestamp += 1;
+            }
 
             if next_token == self.eot_token {
                 break;
@@ -163,15 +183,20 @@ impl WhisperAligner {
     }
 
     /// Parse decoded tokens into word timestamps using timestamp token pairs.
+    ///
+    /// Words are identified by BPE token boundaries (Whisper tokens start with
+    /// a space character for word beginnings). Duration within a segment is
+    /// distributed proportionally by token count per word, which tracks
+    /// pronunciation duration better than character count.
     fn parse_timestamps(
         &self,
         tokens: &[u32],
         timestamp_begin: u32,
     ) -> anyhow::Result<Vec<WordTimestamp>> {
         let mut result = Vec::new();
-        // We seeded <|0.00|> so the first segment starts at 0
         let mut current_start: Option<f32> = Some(0.0);
-        let mut current_words: Vec<String> = Vec::new();
+        // Accumulate (decoded_text, token_count) per word in current segment
+        let mut current_words: Vec<(String, usize)> = Vec::new();
 
         // Skip [SOT, <|0.00|>]
         for &tok in tokens.iter().skip(2) {
@@ -180,51 +205,56 @@ impl WhisperAligner {
             }
 
             if tok >= timestamp_begin {
-                // This is a timestamp token
                 let time_sec = (tok - timestamp_begin) as f32 * 0.02;
 
                 if current_start.is_none() {
-                    // Opening timestamp
                     current_start = Some(time_sec);
                 } else {
-                    // Closing timestamp — emit segment
+                    // Closing timestamp — emit words
                     let start = current_start.unwrap();
                     let end = time_sec;
 
                     if !current_words.is_empty() {
-                        let full_text = current_words.join("");
-                        // Split into words and distribute timing proportionally
-                        let words: Vec<&str> = full_text
-                            .split_whitespace()
-                            .filter(|w| !w.is_empty())
-                            .collect();
+                        let total_tokens: usize =
+                            current_words.iter().map(|(_, count)| count).sum();
+                        let duration = end - start;
+                        let mut offset = start;
 
-                        if !words.is_empty() {
-                            let total_chars: usize = words.iter().map(|w| w.len()).sum();
-                            let duration = end - start;
-                            let mut offset = start;
-
-                            for word in &words {
-                                let frac = word.len() as f32 / total_chars as f32;
-                                let word_dur = duration * frac;
-                                result.push(WordTimestamp {
-                                    word: word.to_string(),
-                                    start_sec: offset,
-                                    end_sec: offset + word_dur,
-                                });
-                                offset += word_dur;
-                            }
+                        for (word, token_count) in &current_words {
+                            let frac = *token_count as f32 / total_tokens as f32;
+                            let word_dur = duration * frac;
+                            result.push(WordTimestamp {
+                                word: word.clone(),
+                                start_sec: offset,
+                                end_sec: offset + word_dur,
+                            });
+                            offset += word_dur;
                         }
                     }
 
                     current_words.clear();
-                    // This closing timestamp is also the opening of the next segment
                     current_start = Some(time_sec);
                 }
             } else {
-                // Text token — decode to string
+                // Text token — decode and group into words.
+                // Whisper BPE tokens that start a new word begin with a space.
                 if let Ok(text) = self.tokenizer.decode(&[tok], false) {
-                    current_words.push(text);
+                    let starts_new_word = text.starts_with(' ');
+                    let clean = text.trim().to_string();
+                    if clean.is_empty() {
+                        continue;
+                    }
+
+                    if starts_new_word || current_words.is_empty() {
+                        // New word
+                        current_words.push((clean, 1));
+                    } else {
+                        // Continue current word (subword token)
+                        if let Some(last) = current_words.last_mut() {
+                            last.0.push_str(&clean);
+                            last.1 += 1;
+                        }
+                    }
                 }
             }
         }
