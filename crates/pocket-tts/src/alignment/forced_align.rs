@@ -57,6 +57,7 @@ pub struct WordSpan {
 fn char_to_token(c: char) -> Option<usize> {
     match c {
         'a'..='z' => Some(LETTER_A + (c as usize - 'a' as usize)),
+        'A'..='Z' => Some(LETTER_A + (c as usize - 'A' as usize)),
         '\'' => Some(APOSTROPHE),
         _ => None,
     }
@@ -72,14 +73,13 @@ fn char_to_token(c: char) -> Option<usize> {
 /// Words whose characters are all filtered out are skipped entirely.
 /// If nothing remains after filtering, both vecs are empty.
 pub fn text_to_ctc_targets(text: &str) -> (Vec<usize>, Vec<WordSpan>) {
-    let lower = text.to_lowercase();
     let original_words: Vec<&str> = text.split_whitespace().collect();
-    let lower_words: Vec<&str> = lower.split_whitespace().collect();
 
-    // Build per-word token lists (filtering invalid chars).
+    // Build per-word token lists (char_to_token handles case-insensitivity directly,
+    // avoiding a to_lowercase() heap allocation per call).
     let mut word_tokens: Vec<(/* original */ &str, Vec<usize>)> = Vec::new();
-    for (orig, lw) in original_words.iter().zip(lower_words.iter()) {
-        let tokens: Vec<usize> = lw.chars().filter_map(char_to_token).collect();
+    for &orig in &original_words {
+        let tokens: Vec<usize> = orig.chars().filter_map(char_to_token).collect();
         if !tokens.is_empty() {
             word_tokens.push((orig, tokens));
         }
@@ -110,11 +110,10 @@ pub fn text_to_ctc_targets(text: &str) -> (Vec<usize>, Vec<WordSpan>) {
     // Map from flat_tokens index → target index (position of the actual token).
     let mut flat_to_target: Vec<usize> = Vec::with_capacity(flat_tokens.len());
 
-    for (i, &tok) in flat_tokens.iter().enumerate() {
+    for &tok in &flat_tokens {
         targets.push(BLANK); // blank before token
         flat_to_target.push(targets.len());
         targets.push(tok);
-        let _ = i; // silence unused warning
     }
     targets.push(BLANK); // trailing blank
 
@@ -205,6 +204,9 @@ pub fn viterbi_forced_align(log_probs: &[Vec<f32>], targets: &[usize]) -> Result
     }
 
     // --- Termination ---
+    // targets always ends with BLANK (guaranteed by text_to_ctc_targets),
+    // so the final valid states are the last token (num_targets-2) or the
+    // trailing blank (num_targets-1).
     let final_s = if num_targets >= 2
         && score[num_frames - 1][num_targets - 2] > score[num_frames - 1][num_targets - 1]
     {
@@ -244,10 +246,11 @@ pub fn path_to_word_timestamps(
         let mut last_frame: Option<usize> = None;
 
         for (frame_idx, &target_idx) in path.iter().enumerate() {
-            if target_idx >= span.target_start
-                && target_idx < span.target_end
-                && targets[target_idx] != BLANK
-            {
+            // Path is monotonically non-decreasing — no future frame can match this span.
+            if target_idx >= span.target_end {
+                break;
+            }
+            if target_idx >= span.target_start && targets[target_idx] != BLANK {
                 if first_frame.is_none() {
                     first_frame = Some(frame_idx);
                 }
