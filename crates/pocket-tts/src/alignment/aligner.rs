@@ -112,37 +112,50 @@ impl WhisperAligner {
             let _ = child.kill();
         }
 
-        // Start server
+        // Start server — inherit stderr so we see errors, null stdout to prevent pipe blocking
         let is_py = self.server_script.extension().map_or(false, |e| e == "py");
         let child = if is_py {
             Command::new("python3")
                 .arg(&self.server_script)
                 .arg("--port")
                 .arg(SERVER_PORT.to_string())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()?
         } else {
             Command::new(&self.server_script)
                 .arg("--port")
                 .arg(SERVER_PORT.to_string())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()?
         };
 
+        let child_id = child.id();
         *proc = Some(child);
         drop(proc);
 
-        // Wait for server to be ready (max 60s for model loading)
-        for _ in 0..120 {
+        // Wait for server to be ready (max 300s for model loading on slow machines)
+        for i in 0..600 {
             std::thread::sleep(std::time::Duration::from_millis(500));
             if self.server_healthy() {
                 return Ok(());
             }
+            // Check if process died
+            if i % 10 == 0 {
+                let mut proc = self.server_process.lock().unwrap();
+                if let Some(ref mut child) = *proc {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        anyhow::bail!(
+                            "WhisperX server exited with status {} (pid {})",
+                            status, child_id
+                        );
+                    }
+                }
+            }
         }
 
-        anyhow::bail!("WhisperX server failed to start within 60s")
+        anyhow::bail!("WhisperX server failed to start within 300s (pid {})", child_id)
     }
 
     fn server_healthy(&self) -> bool {
