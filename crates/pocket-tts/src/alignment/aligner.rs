@@ -1,8 +1,8 @@
 //! Native Whisper aligner for word-level timestamps.
 //!
-//! Uses candle-transformers' Whisper encoder + our custom autoregressive decoder
-//! that captures cross-attention weights during token-by-token generation.
-//! DTW on those weights gives true per-word alignment.
+//! Combines timestamp tokens (for segment boundaries / pause preservation) with
+//! DTW on cross-attention weights (for per-word timing within segments). This
+//! matches the approach used by OpenAI's Whisper `--word_timestamps True`.
 //!
 //! No Python, no C++ FFI, no external processes. Pure Rust.
 
@@ -19,10 +19,22 @@ use tokenizers::Tokenizer;
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 const WHISPER_REPO: &str = "openai/whisper-base.en";
+const HOP_LENGTH: usize = 160;
+const ENCODER_DOWNSAMPLE: usize = 2;
 
 const MEL_FILTERS: &[u8] = include_bytes!("melfilters.bytes");
 
-/// Native Whisper-based aligner with autoregressive cross-attention capture.
+/// A decoded segment: timestamp-bounded group of text tokens.
+struct Segment {
+    start_sec: f32,
+    end_sec: f32,
+    /// Indices into the full token list (positions of text tokens in this segment)
+    token_positions: Vec<usize>,
+    /// The text token IDs themselves
+    token_ids: Vec<u32>,
+}
+
+/// Native Whisper-based aligner. Segment timestamps + per-segment DTW.
 #[derive(Clone)]
 pub struct WhisperAligner {
     encoder: Arc<std::sync::Mutex<w::model::Whisper>>,
@@ -38,7 +50,6 @@ pub struct WhisperAligner {
 }
 
 impl WhisperAligner {
-    /// Load whisper-base.en (~140MB). Downloads from HuggingFace on first use.
     pub fn load(device: &Device) -> anyhow::Result<Self> {
         let weights_path = crate::weights::download_if_necessary(
             &format!("hf://{}/model.safetensors", WHISPER_REPO),
@@ -56,10 +67,8 @@ impl WhisperAligner {
             VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)?
         };
 
-        // Load candle-transformers encoder (we only use the encoder from it)
         let encoder_model = w::model::Whisper::load(&vb, config.clone())?;
 
-        // Load our custom autoregressive decoder with attention capture
         let ar_config = ARDecoderConfig {
             d_model: config.d_model,
             n_head: config.decoder_attention_heads,
@@ -76,7 +85,6 @@ impl WhisperAligner {
         let eot_token = token_id(&tokenizer, w::EOT_TOKEN)?;
         let no_timestamps_token = token_id(&tokenizer, w::NO_TIMESTAMPS_TOKEN)?;
 
-        // Build suppress mask as Vec<f32> (applied manually to logits)
         let mut suppress_tokens = vec![0f32; config.vocab_size];
         for &t in &config.suppress_tokens {
             if (t as usize) < config.vocab_size {
@@ -101,9 +109,8 @@ impl WhisperAligner {
         })
     }
 
-    /// Align audio, producing word-level timestamps via DTW on cross-attention.
     pub fn align(&self, audio: &Tensor, _text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
-        // 1. Prepare audio: mono, 16kHz
+        // 1. Prepare audio
         let audio = match audio.dims().len() {
             1 => audio.unsqueeze(0)?,
             2 if audio.dims()[0] == 1 => audio.clone(),
@@ -117,42 +124,50 @@ impl WhisperAligner {
         let mel = w::audio::pcm_to_mel(&self.config, &pcm, &self.mel_filters);
         let mel_len = mel.len() / self.config.num_mel_bins;
         let mel_tensor = Tensor::from_vec(
-            mel,
-            (1, self.config.num_mel_bins, mel_len),
-            &self.device,
+            mel, (1, self.config.num_mel_bins, mel_len), &self.device,
         )?;
 
-        // 3. Encode audio using candle-transformers encoder
+        // 3. Encode
         let mut encoder = self.encoder.lock().unwrap();
         encoder.reset_kv_cache();
         let audio_features = encoder.encoder.forward(&mel_tensor, true)?;
         drop(encoder);
 
-        // 4. Autoregressive decode with our custom decoder (captures attention)
+        // 4. Autoregressive decode (captures cross-attention at each step)
         let mut decoder = self.decoder.lock().unwrap();
         decoder.reset_cache();
 
-        // Seed with SOT token
-        let mut tokens: Vec<u32> = vec![self.sot_token];
-        let max_tokens = self.config.max_target_positions / 2;
+        let timestamp_begin = self.no_timestamps_token + 1;
+        let first_timestamp = timestamp_begin; // <|0.00|>
+        let mut tokens: Vec<u32> = vec![self.sot_token, first_timestamp];
 
-        // First step: SOT
+        // Seed SOT + <|0.00|>
         let _ = decoder.forward_one(self.sot_token, &audio_features, 0)?;
+        let _ = decoder.forward_one(first_timestamp, &audio_features, 1)?;
 
-        for step in 1..max_tokens {
+        let max_tokens = self.config.max_target_positions / 2;
+        // Force shorter segments: bias toward timestamp tokens after a few text tokens
+        const MAX_TEXT_PER_SEG: usize = 3;
+        const TS_BIAS: f32 = 6.0;
+        let mut text_since_ts: usize = 0;
+
+        for step in 2..max_tokens {
             let logits = decoder.forward_one(
-                *tokens.last().unwrap(),
-                &audio_features,
-                step,
+                *tokens.last().unwrap(), &audio_features, step,
             )?;
 
-            // Apply suppress mask
             let mut logits_vec: Vec<f32> = logits.to_vec1()?;
             for (i, mask) in self.suppress_tokens.iter().enumerate() {
                 logits_vec[i] += mask;
             }
 
-            // Greedy argmax
+            // Bias toward timestamp tokens when segment is getting long
+            if text_since_ts >= MAX_TEXT_PER_SEG {
+                for tok_id in (timestamp_begin as usize)..logits_vec.len() {
+                    logits_vec[tok_id] += TS_BIAS;
+                }
+            }
+
             let next_token = logits_vec
                 .iter()
                 .enumerate()
@@ -162,18 +177,24 @@ impl WhisperAligner {
 
             tokens.push(next_token);
 
+            if next_token >= timestamp_begin {
+                text_since_ts = 0;
+            } else if next_token != self.eot_token {
+                text_since_ts += 1;
+            }
+
             if next_token == self.eot_token {
                 break;
             }
         }
 
-        // 5. Get cross-attention matrix [n_tokens, n_audio_frames]
+        // 5. Get full attention matrix [n_steps, n_audio_frames]
         let attn_matrix = decoder.get_cross_attention_matrix()?;
         drop(decoder);
 
-        // 6. Trim to actual audio frames (encoder pads to 1500 frames for 30s)
-        let raw_mel_frames = (pcm.len() + 159) / 160;
-        let actual_frames = (raw_mel_frames + 1) / 2; // encoder 2x downsampling
+        // Trim to actual audio frames
+        let raw_mel_frames = (pcm.len() + HOP_LENGTH - 1) / HOP_LENGTH;
+        let actual_frames = (raw_mel_frames + ENCODER_DOWNSAMPLE - 1) / ENCODER_DOWNSAMPLE;
         let n_audio = attn_matrix.dim(1)?;
         let trim = actual_frames.min(n_audio);
         let attn_matrix = if trim < n_audio {
@@ -182,54 +203,106 @@ impl WhisperAligner {
             attn_matrix
         };
 
-        // 7. Filter to text-only tokens (skip SOT, timestamps, EOT)
-        let text_token_indices: Vec<usize> = tokens
-            .iter()
-            .enumerate()
-            .filter(|&(_, &t)| t < self.sot_token && t != self.eot_token)
-            .map(|(i, _)| i)
-            .collect();
+        // 6. Parse tokens into segments using timestamp tokens
+        let segments = self.parse_segments(&tokens, timestamp_begin);
 
-        if text_token_indices.is_empty() {
-            return Ok(Vec::new());
-        }
+        // 7. For each segment, run DTW on its portion of the attention matrix
+        let mut all_timestamps = Vec::new();
 
-        let text_tokens: Vec<u32> = text_token_indices
-            .iter()
-            .map(|&i| tokens[i])
-            .collect();
+        for seg in &segments {
+            if seg.token_ids.is_empty() {
+                continue;
+            }
 
-        // Extract attention rows for text tokens only
-        // attn_matrix is [n_all_tokens, n_audio], we want [n_text_tokens, n_audio]
-        let text_attn_rows: Vec<Tensor> = text_token_indices
-            .iter()
-            .filter_map(|&i| {
-                // Token at position i corresponds to attention captured at step i
-                // (step 0 = SOT, step 1 = first generated token, etc.)
-                if i < attn_matrix.dim(0).unwrap_or(0) {
-                    attn_matrix.get(i).ok()
-                } else {
-                    None
+            // Convert segment time to encoder frames
+            let start_frame = sec_to_frame(seg.start_sec);
+            let end_frame = sec_to_frame(seg.end_sec).min(trim);
+
+            if end_frame <= start_frame {
+                continue;
+            }
+
+            // Extract attention sub-matrix for this segment:
+            // rows = text token positions, cols = segment's audio frame range
+            let mut seg_attn_rows: Vec<Vec<f32>> = Vec::new();
+            for &pos in &seg.token_positions {
+                if pos < attn_matrix.dim(0)? {
+                    let row = attn_matrix.get(pos)?;
+                    // Narrow to segment's frame range
+                    let seg_row = row.narrow(0, start_frame, end_frame - start_frame)?;
+                    seg_attn_rows.push(seg_row.to_vec1()?);
                 }
-            })
-            .collect();
+            }
 
-        if text_attn_rows.is_empty() {
-            return Ok(Vec::new());
+            if seg_attn_rows.is_empty() {
+                continue;
+            }
+
+            // DTW within this segment
+            let token_alignments = dtw_alignment(&seg_attn_rows);
+
+            // Convert frame offsets to absolute timestamps
+            let seg_timestamps = extract_word_timestamps(
+                &token_alignments, &seg.token_ids, &self.tokenizer,
+            );
+
+            // Offset timestamps by segment start + frame offset
+            for mut ts in seg_timestamps {
+                ts.start_sec += seg.start_sec;
+                ts.end_sec += seg.start_sec;
+                all_timestamps.push(ts);
+            }
         }
 
-        let text_attn = Tensor::stack(&text_attn_rows, 0)?;
-        let attn_2d: Vec<Vec<f32>> = text_attn.to_vec2()?;
-
-        // 8. DTW alignment
-        let token_alignments = dtw_alignment(&attn_2d);
-
-        // 9. Convert to word timestamps
-        let timestamps =
-            extract_word_timestamps(&token_alignments, &text_tokens, &self.tokenizer);
-
-        Ok(timestamps)
+        Ok(all_timestamps)
     }
+
+    /// Parse decoded token sequence into segments bounded by timestamp tokens.
+    fn parse_segments(&self, tokens: &[u32], timestamp_begin: u32) -> Vec<Segment> {
+        let mut segments = Vec::new();
+        let mut current_start: Option<f32> = None;
+        let mut current_positions: Vec<usize> = Vec::new();
+        let mut current_ids: Vec<u32> = Vec::new();
+
+        for (pos, &tok) in tokens.iter().enumerate() {
+            if tok == self.sot_token || tok == self.eot_token {
+                continue;
+            }
+
+            if tok >= timestamp_begin {
+                let time_sec = (tok - timestamp_begin) as f32 * 0.02;
+
+                if let Some(start) = current_start {
+                    if !current_ids.is_empty() {
+                        segments.push(Segment {
+                            start_sec: start,
+                            end_sec: time_sec,
+                            token_positions: std::mem::take(&mut current_positions),
+                            token_ids: std::mem::take(&mut current_ids),
+                        });
+                    } else {
+                        current_positions.clear();
+                        current_ids.clear();
+                    }
+                }
+                current_start = Some(time_sec);
+            } else {
+                // Text token
+                current_positions.push(pos);
+                current_ids.push(tok);
+            }
+        }
+
+        segments
+    }
+}
+
+/// Convert seconds to encoder frame index.
+fn sec_to_frame(sec: f32) -> usize {
+    // Each encoder frame = HOP_LENGTH * ENCODER_DOWNSAMPLE samples at 16kHz
+    // = 320 samples = 20ms
+    let samples = (sec * WHISPER_SAMPLE_RATE as f32) as usize;
+    samples / (HOP_LENGTH * ENCODER_DOWNSAMPLE)
 }
 
 use byteorder::ByteOrder;
