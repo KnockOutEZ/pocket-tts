@@ -1141,7 +1141,52 @@ impl TTSModel {
         (prepared.split_whitespace().count() + 2) * 13
     }
 
-    /// Load TTS model + alignment model together
+    /// Download all model weights without loading them into memory.
+    /// Call this on first app launch to ensure everything is cached.
+    /// Subsequent calls are instant (checks local cache).
+    ///
+    /// Downloads:
+    /// - TTS model weights (~90MB)
+    /// - TTS tokenizer
+    /// - Voice embeddings for the specified voice
+    ///
+    /// Does NOT start the WhisperX server (that happens when opening a book).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn preload_weights(variant: &str, voice: Option<&str>) -> Result<()> {
+        // Download TTS config + weights
+        let config_path = find_config_path(variant)?;
+        let config = crate::config::load_config(&config_path)?;
+
+        if let Some(weights_path) = &config.weights_path {
+            eprintln!("Checking TTS model weights...");
+            crate::weights::download_if_necessary(weights_path)?;
+        }
+
+        // Download tokenizer
+        eprintln!("Checking tokenizer...");
+        crate::weights::download_if_necessary(&config.flow_lm.lookup_table.tokenizer_path)?;
+
+        // Download voice embeddings
+        if let Some(voice_name) = voice {
+            eprintln!("Checking voice embeddings ({})...", voice_name);
+            let voice_path = format!(
+                "hf://kyutai/pocket-tts-without-voice-cloning/embeddings/{}.safetensors",
+                voice_name
+            );
+            crate::weights::download_if_necessary(&voice_path)?;
+        }
+
+        // Check WhisperX server script exists (model downloads happen on server start)
+        eprintln!("Checking WhisperX aligner...");
+        crate::alignment::WhisperAligner::check_available()?;
+
+        eprintln!("All weights ready.");
+        Ok(())
+    }
+
+    /// Load TTS model + alignment model together.
+    /// Starts the WhisperX server (models load ~15s on first call).
+    /// Call this when the user opens a book.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_with_alignment(variant: &str) -> Result<Self> {
         let mut model = Self::load(variant)?;

@@ -44,6 +44,13 @@ impl WhisperAligner {
         Ok(aligner)
     }
 
+    /// Check if the WhisperX backend is available (script or binary exists).
+    /// Does NOT start the server or load models.
+    pub fn check_available() -> anyhow::Result<()> {
+        Self::find_server_script()?;
+        Ok(())
+    }
+
     fn find_server_script() -> anyhow::Result<PathBuf> {
         let candidates = [
             PathBuf::from("scripts/whisperx_server.py"),
