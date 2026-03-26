@@ -43,7 +43,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install whisperx pyinstaller
-          pip install transformers tokenizers huggingface-hub
+          pip install transformers tokenizers huggingface-hub torchcodec
 
       - name: Build standalone binary
         run: |
@@ -58,6 +58,7 @@ jobs:
             --collect-all tokenizers \
             --copy-metadata torch \
             --copy-metadata torchaudio \
+            --copy-metadata torchcodec \
             --copy-metadata transformers \
             --copy-metadata tokenizers \
             --copy-metadata huggingface-hub \
@@ -65,6 +66,9 @@ jobs:
             --copy-metadata faster-whisper \
             --copy-metadata ctranslate2 \
             --copy-metadata whisperx \
+            --copy-metadata pyannote-audio \
+            --copy-metadata pyannote-core \
+            --copy-metadata pyannote-pipeline \
             scripts/whisperx_server.py
         shell: bash
 
