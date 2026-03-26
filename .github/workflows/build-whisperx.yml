@@ -1,0 +1,108 @@
+name: Build WhisperX Sidecar
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # Manual trigger
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon
+            target: macos-arm64
+            pyinstaller_args: ""
+          - os: macos-13        # Intel Mac
+            target: macos-x64
+            pyinstaller_args: ""
+          - os: ubuntu-22.04
+            target: linux-x64
+            pyinstaller_args: ""
+          - os: windows-latest
+            target: windows-x64
+            pyinstaller_args: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install whisperx pyinstaller
+          pip install transformers tokenizers huggingface-hub
+
+      - name: Build standalone binary
+        run: |
+          pyinstaller \
+            --onefile \
+            --name whisperx_server \
+            --collect-all whisperx \
+            --collect-all faster_whisper \
+            --collect-all ctranslate2 \
+            --collect-all pyannote \
+            --collect-all transformers \
+            --collect-all tokenizers \
+            --copy-metadata torch \
+            --copy-metadata torchaudio \
+            --copy-metadata transformers \
+            --copy-metadata tokenizers \
+            --copy-metadata huggingface-hub \
+            --copy-metadata safetensors \
+            --copy-metadata faster-whisper \
+            --copy-metadata ctranslate2 \
+            --copy-metadata whisperx \
+            scripts/whisperx_server.py
+        shell: bash
+
+      - name: Rename binary
+        run: |
+          if [ "${{ matrix.target }}" = "windows-x64" ]; then
+            mv dist/whisperx_server.exe dist/whisperx_server-${{ matrix.target }}.exe
+          else
+            mv dist/whisperx_server dist/whisperx_server-${{ matrix.target }}
+          fi
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisperx_server-${{ matrix.target }}
+          path: dist/whisperx_server-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body: |
+            ## WhisperX Sidecar Binaries
+
+            Pre-built WhisperX alignment server for pocket-tts.
+
+            Download the binary for your platform and place it next to your app executable.
+            The binary includes Python + PyTorch + WhisperX — no external dependencies needed.
+
+            | Platform | Binary |
+            |----------|--------|
+            | macOS ARM64 (M1/M2/M3) | `whisperx_server-macos-arm64` |
+            | macOS Intel | `whisperx_server-macos-x64` |
+            | Linux x64 | `whisperx_server-linux-x64` |
+            | Windows x64 | `whisperx_server-windows-x64.exe` |
