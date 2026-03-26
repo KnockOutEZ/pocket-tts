@@ -238,6 +238,13 @@ impl WhisperAligner {
                 continue;
             }
 
+            // Preprocess attention (matches OpenAI Whisper pipeline):
+            // 1. Median filter — sharpens peaks, reduces noise
+            median_filter_2d(&mut seg_attn_rows, 3);
+            // 2. Per-row normalization — ensures each token gets fair weight
+            //    (prevents content words from dominating function words)
+            normalize_rows(&mut seg_attn_rows);
+
             // DTW within this segment
             let token_alignments = dtw_alignment(&seg_attn_rows);
 
@@ -311,6 +318,63 @@ fn token_id(tokenizer: &Tokenizer, token: &str) -> anyhow::Result<u32> {
     tokenizer
         .token_to_id(token)
         .ok_or_else(|| anyhow::anyhow!("Token '{}' not found in vocabulary", token))
+}
+
+/// Apply 2D median filter to attention matrix (in-place).
+/// This matches OpenAI Whisper's `medfilt` preprocessing before DTW.
+/// Sharpens attention peaks and removes noise, improving alignment accuracy.
+fn median_filter_2d(matrix: &mut [Vec<f32>], kernel_size: usize) {
+    if matrix.is_empty() || matrix[0].is_empty() || kernel_size <= 1 {
+        return;
+    }
+
+    let rows = matrix.len();
+    let cols = matrix[0].len();
+    let half = kernel_size / 2;
+
+    // Filter along columns (time axis) for each row
+    let mut buf = vec![0f32; kernel_size];
+    for row in matrix.iter_mut() {
+        let orig = row.clone();
+        for j in 0..cols {
+            let start = j.saturating_sub(half);
+            let end = (j + half + 1).min(cols);
+            let len = end - start;
+            buf[..len].copy_from_slice(&orig[start..end]);
+            buf[..len].sort_unstable_by(|a, b| a.total_cmp(b));
+            row[j] = buf[len / 2];
+        }
+    }
+
+    // Filter along rows (token axis) for each column
+    for j in 0..cols {
+        let orig: Vec<f32> = (0..rows).map(|i| matrix[i][j]).collect();
+        for i in 0..rows {
+            let start = i.saturating_sub(half);
+            let end = (i + half + 1).min(rows);
+            let len = end - start;
+            buf[..len].copy_from_slice(&orig[start..end]);
+            buf[..len].sort_unstable_by(|a, b| a.total_cmp(b));
+            matrix[i][j] = buf[len / 2];
+        }
+    }
+}
+
+/// Normalize each row to zero mean, unit variance.
+/// Ensures every token has equal weight in DTW regardless of attention magnitude.
+fn normalize_rows(matrix: &mut [Vec<f32>]) {
+    for row in matrix.iter_mut() {
+        if row.is_empty() {
+            continue;
+        }
+        let n = row.len() as f32;
+        let mean: f32 = row.iter().sum::<f32>() / n;
+        let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
+        let std = (var + 1e-8).sqrt();
+        for x in row.iter_mut() {
+            *x = (*x - mean) / std;
+        }
+    }
 }
 
 #[cfg(test)]
