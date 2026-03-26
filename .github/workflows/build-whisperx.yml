@@ -57,6 +57,8 @@ jobs:
           ARGS="$ARGS --collect-all pyannote"
           ARGS="$ARGS --collect-all transformers"
           ARGS="$ARGS --collect-all tokenizers"
+          ARGS="$ARGS --hidden-import transformers.pipelines"
+          ARGS="$ARGS --hidden-import transformers.pipelines.base_pipeline"
           ARGS="$ARGS --copy-metadata torch"
           ARGS="$ARGS --copy-metadata torchaudio"
           ARGS="$ARGS --copy-metadata transformers"

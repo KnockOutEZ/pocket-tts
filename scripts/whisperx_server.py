@@ -21,14 +21,14 @@ import importlib.metadata as _md
 _orig_version = _md.version
 def _patched_version(name):
     if name == "torchcodec":
-        raise _md.PackageNotFoundError(name)
+        return "0.0.0"  # fake version — transformers sees old version and skips
     return _orig_version(name)
 _md.version = _patched_version
 try:
     _orig_dist = _md.distribution
     def _patched_dist(name):
         if name == "torchcodec":
-            raise _md.PackageNotFoundError(name)
+            return "0.0.0"
         return _orig_dist(name)
     _md.distribution = _patched_dist
 except AttributeError:
