@@ -13,7 +13,7 @@ jobs:
           - os: macos-14        # Apple Silicon
             target: macos-arm64
             pyinstaller_args: ""
-          - os: macos-13        # Intel Mac
+          - os: macos-15        # Intel Mac
             target: macos-x64
             pyinstaller_args: ""
           - os: ubuntu-22.04
