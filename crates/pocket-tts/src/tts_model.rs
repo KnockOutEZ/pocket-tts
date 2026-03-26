@@ -1141,34 +1141,37 @@ impl TTSModel {
         (prepared.split_whitespace().count() + 2) * 13
     }
 
-    /// Download all model weights without loading them into memory.
-    /// Call this on first app launch to ensure everything is cached.
-    /// Subsequent calls are instant (checks local cache).
+    /// Download and verify ALL model weights. Call on every app startup.
+    ///
+    /// First run: downloads everything (~530MB total).
+    /// Subsequent runs: checks cache, re-downloads only if missing/corrupt.
     ///
     /// Downloads:
     /// - TTS model weights (~90MB)
-    /// - TTS tokenizer
-    /// - Voice embeddings for the specified voice
+    /// - TTS tokenizer (~2MB)
+    /// - ALL voice embeddings (~5MB each)
+    /// - WhisperX models: Whisper tiny.en (~75MB) + wav2vec2-base (~360MB)
     ///
-    /// Does NOT start the WhisperX server (that happens when opening a book).
+    /// Pass a callback to report progress to the UI.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn preload_weights(variant: &str, voice: Option<&str>) -> Result<()> {
-        // Download TTS config + weights
+    pub fn preload_weights(variant: &str, voices: &[&str]) -> Result<()> {
+        // 1. TTS config + weights
         let config_path = find_config_path(variant)?;
         let config = crate::config::load_config(&config_path)?;
 
         if let Some(weights_path) = &config.weights_path {
-            eprintln!("Checking TTS model weights...");
+            eprintln!("[1/4] Checking TTS model weights...");
             crate::weights::download_if_necessary(weights_path)?;
         }
 
-        // Download tokenizer
-        eprintln!("Checking tokenizer...");
+        // 2. Tokenizer
+        eprintln!("[2/4] Checking tokenizer...");
         crate::weights::download_if_necessary(&config.flow_lm.lookup_table.tokenizer_path)?;
 
-        // Download voice embeddings
-        if let Some(voice_name) = voice {
-            eprintln!("Checking voice embeddings ({})...", voice_name);
+        // 3. ALL voice embeddings
+        eprintln!("[3/4] Checking voice embeddings...");
+        for voice_name in voices {
+            eprintln!("  - {}", voice_name);
             let voice_path = format!(
                 "hf://kyutai/pocket-tts-without-voice-cloning/embeddings/{}.safetensors",
                 voice_name
@@ -1176,13 +1179,18 @@ impl TTSModel {
             crate::weights::download_if_necessary(&voice_path)?;
         }
 
-        // Check WhisperX server script exists (model downloads happen on server start)
-        eprintln!("Checking WhisperX aligner...");
-        crate::alignment::WhisperAligner::check_available()?;
+        // 4. WhisperX models (Whisper + wav2vec2) — download without starting server
+        eprintln!("[4/4] Checking WhisperX alignment models...");
+        crate::alignment::WhisperAligner::preload_models()?;
 
-        eprintln!("All weights ready.");
+        eprintln!("All models ready.");
         Ok(())
     }
+
+    /// List of all predefined voice names.
+    pub const VOICES: &[&str] = &[
+        "alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma",
+    ];
 
     /// Load TTS model + alignment model together.
     /// Starts the WhisperX server (models load ~15s on first call).

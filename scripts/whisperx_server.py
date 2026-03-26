@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--port", type=int, default=9876)
     parser.add_argument("--model", default="tiny.en")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--preload", action="store_true",
+                        help="Download all models and exit (no server)")
     args = parser.parse_args()
 
     import whisperx
@@ -31,8 +33,12 @@ def main():
     print(f"Loading WhisperX model ({args.model})...", flush=True)
     model = whisperx.load_model(args.model, args.device, compute_type="float32")
 
-    print("Loading alignment model...", flush=True)
+    print("Loading alignment model (wav2vec2-base)...", flush=True)
     model_a, metadata = whisperx.load_align_model(language_code="en", device=args.device)
+
+    if args.preload:
+        print("All models downloaded and verified.", flush=True)
+        return
 
     print(f"Ready on port {args.port}", flush=True)
 

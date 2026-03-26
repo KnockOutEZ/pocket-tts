@@ -51,6 +51,31 @@ impl WhisperAligner {
         Ok(())
     }
 
+    /// Download WhisperX models (Whisper + wav2vec2) without starting the server.
+    /// Call during app startup to ensure all models are cached.
+    pub fn preload_models() -> anyhow::Result<()> {
+        let script = Self::find_server_script()?;
+
+        let is_py = script.extension().map_or(false, |e| e == "py");
+        let output = if is_py {
+            Command::new("python3")
+                .arg(&script)
+                .arg("--preload")
+                .output()?
+        } else {
+            Command::new(&script)
+                .arg("--preload")
+                .output()?
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("WhisperX model preload failed: {}", stderr);
+        }
+
+        Ok(())
+    }
+
     fn find_server_script() -> anyhow::Result<PathBuf> {
         let candidates = [
             PathBuf::from("scripts/whisperx_server.py"),
