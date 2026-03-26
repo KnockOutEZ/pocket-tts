@@ -14,16 +14,25 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
-# Patch: torchcodec may not be available on all platforms.
-# transformers checks for it via importlib.metadata.version() and crashes if missing.
-# This makes the check return gracefully instead of crashing.
-import importlib.metadata
-_orig_dist = importlib.metadata.distribution
-def _safe_dist(name):
+# Patch: torchcodec may not be available on all platforms (especially in PyInstaller).
+# transformers.audio_utils checks importlib.metadata.version("torchcodec") and crashes.
+# We patch both version() and distribution() to gracefully skip torchcodec.
+import importlib.metadata as _md
+_orig_version = _md.version
+def _patched_version(name):
     if name == "torchcodec":
-        raise importlib.metadata.PackageNotFoundError(name)
-    return _orig_dist(name)
-importlib.metadata.distribution = _safe_dist
+        raise _md.PackageNotFoundError(name)
+    return _orig_version(name)
+_md.version = _patched_version
+try:
+    _orig_dist = _md.distribution
+    def _patched_dist(name):
+        if name == "torchcodec":
+            raise _md.PackageNotFoundError(name)
+        return _orig_dist(name)
+    _md.distribution = _patched_dist
+except AttributeError:
+    pass
 
 def main():
     parser = argparse.ArgumentParser()
