@@ -13,6 +13,10 @@ import sys
 import warnings
 warnings.filterwarnings("ignore")
 
+# Force imports that PyInstaller can't trace through transformers' lazy __getattr__
+import transformers.pipelines  # noqa: F401
+from transformers import Pipeline  # noqa: F401
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("audio", help="Input WAV file")

@@ -1,10 +1,12 @@
 //! WhisperX-based aligner for word-level timestamps.
 //!
-//! Uses WhisperX (Whisper + wav2vec2 forced alignment) via a Python sidecar
-//! script for production-grade word-level timestamps (~20-50ms accuracy).
+//! Uses WhisperX (Whisper + wav2vec2 forced alignment) for production-grade
+//! word-level timestamps (~20-50ms accuracy).
 //!
-//! For shipping: compile whisperx_align.py with PyInstaller to a standalone
-//! binary — no Python needed on customer machines.
+//! Backends (auto-detected in order):
+//! 1. Python script (dev: scripts/whisperx_align.py)
+//! 2. Standalone binary (shipped: PyInstaller-compiled whisperx_align)
+//! 3. Docker container (fallback: whisperx-align image)
 
 use crate::alignment::forced_align::WordTimestamp;
 use crate::audio::resample;
@@ -15,66 +17,93 @@ use std::process::Command;
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 
+#[derive(Clone, Debug)]
+enum Backend {
+    /// Python script (requires python3 + whisperx installed)
+    PythonScript(PathBuf),
+    /// Standalone binary (PyInstaller-compiled, no Python needed)
+    Binary(PathBuf),
+    /// Docker container (no local deps needed)
+    Docker(String),
+}
+
 /// WhisperX-based aligner for production-grade word timestamps.
-///
-/// Uses Whisper for transcription + wav2vec2 CTC forced alignment for
-/// phoneme-level word boundary precision. ~20-50ms accuracy.
 #[derive(Clone)]
 pub struct WhisperAligner {
-    script_path: PathBuf,
+    backend: Backend,
 }
 
 impl WhisperAligner {
-    /// Load the aligner. Finds the whisperx_align script/binary.
+    /// Load the aligner. Auto-detects the best available backend.
     pub fn load(_device: &Device) -> anyhow::Result<Self> {
-        let script_path = Self::find_script()?;
-        Ok(Self { script_path })
+        let backend = Self::detect_backend()?;
+        Ok(Self { backend })
     }
 
-    /// Find the alignment script/binary. Checks:
-    /// 1. scripts/whisperx_align.py (dev)
-    /// 2. Next to running executable as whisperx_align (PyInstaller binary)
-    /// 3. In PATH
-    fn find_script() -> anyhow::Result<PathBuf> {
-        let candidates = [
-            // Dev: script in workspace
+    /// Detect available backend in priority order.
+    fn detect_backend() -> anyhow::Result<Backend> {
+        // 1. Python script (dev mode)
+        let py_candidates = [
             PathBuf::from("scripts/whisperx_align.py"),
-            // Bundled PyInstaller binary next to exe
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("whisperx_align")))
-                .unwrap_or_default(),
-            // In crate bin/
-            PathBuf::from("crates/pocket-tts/bin/whisperx_align"),
-            PathBuf::from("bin/whisperx_align"),
+            PathBuf::from("crates/pocket-tts/scripts/whisperx_align.py"),
         ];
-
-        for path in &candidates {
+        for path in &py_candidates {
             if path.exists() {
-                return Ok(path.clone());
-            }
-        }
-
-        // Check PATH
-        if let Ok(output) = Command::new("which").arg("whisperx_align").output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Ok(PathBuf::from(path));
+                // Verify python3 can import whisperx
+                if Command::new("python3")
+                    .args(["-c", "import whisperx"])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+                {
+                    return Ok(Backend::PythonScript(path.clone()));
                 }
             }
         }
 
+        // 2. Standalone binary
+        let bin_candidates = [
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("whisperx_align")))
+                .unwrap_or_default(),
+            PathBuf::from("bin/whisperx_align"),
+            PathBuf::from("crates/pocket-tts/bin/whisperx_align"),
+        ];
+        for path in &bin_candidates {
+            if path.exists() {
+                return Ok(Backend::Binary(path.clone()));
+            }
+        }
+        // Check PATH
+        if let Ok(output) = Command::new("which").arg("whisperx_align").output() {
+            if output.status.success() {
+                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !p.is_empty() {
+                    return Ok(Backend::Binary(PathBuf::from(p)));
+                }
+            }
+        }
+
+        // 3. Docker
+        if Command::new("docker")
+            .args(["image", "inspect", "whisperx-align"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Ok(Backend::Docker("whisperx-align".to_string()));
+        }
+
         anyhow::bail!(
-            "WhisperX aligner not found. Expected scripts/whisperx_align.py \
-             or a compiled whisperx_align binary in PATH."
+            "No WhisperX backend found. Options:\n\
+             1. Install whisperx: pip install whisperx (+ scripts/whisperx_align.py)\n\
+             2. Place compiled whisperx_align binary next to your app\n\
+             3. Build Docker image: cd scripts && docker build -f Dockerfile.whisperx -t whisperx-align ."
         )
     }
 
     /// Align audio to produce word-level timestamps.
-    ///
-    /// `audio`: Tensor `[C, T]` at 24kHz (TTS output).
-    /// `text`: Known text — passed to WhisperX for guided alignment.
     pub fn align(&self, audio: &Tensor, text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
         // 1. Mono, resample 24kHz → 16kHz
         let audio = match audio.dims().len() {
@@ -104,27 +133,43 @@ impl WhisperAligner {
             writer.finalize()?;
         }
 
-        // 3. Run WhisperX alignment
-        let mut cmd = if self.script_path.extension().map_or(false, |e| e == "py") {
-            let mut c = Command::new("python3");
-            c.arg(&self.script_path);
-            c
-        } else {
-            Command::new(&self.script_path)
+        // 3. Run alignment via detected backend
+        let output = match &self.backend {
+            Backend::PythonScript(script) => {
+                let mut cmd = Command::new("python3");
+                cmd.arg(script).arg(&wav_path).arg(&json_path);
+                if !text.is_empty() {
+                    cmd.arg("--text").arg(text);
+                }
+                cmd.output()?
+            }
+            Backend::Binary(bin) => {
+                let mut cmd = Command::new(bin);
+                cmd.arg(&wav_path).arg(&json_path);
+                if !text.is_empty() {
+                    cmd.arg("--text").arg(text);
+                }
+                cmd.output()?
+            }
+            Backend::Docker(image) => {
+                let mut cmd = Command::new("docker");
+                cmd.args(["run", "--rm", "-v"]);
+                cmd.arg(format!("{}:{}", tmp_dir.display(), tmp_dir.display()));
+                cmd.arg(image);
+                cmd.arg(&wav_path).arg(&json_path);
+                if !text.is_empty() {
+                    cmd.arg("--text").arg(text);
+                }
+                cmd.output()?
+            }
         };
 
-        cmd.arg(&wav_path).arg(&json_path);
-        if !text.is_empty() {
-            cmd.arg("--text").arg(text);
-        }
-
-        let output = cmd.output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("WhisperX alignment failed: {}", stderr);
         }
 
-        // 4. Parse JSON output
+        // 4. Parse JSON
         let json_str = std::fs::read_to_string(&json_path)?;
         let words: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
 
@@ -158,6 +203,7 @@ mod tests {
     #[ignore]
     fn test_whisperx_aligner_loads() {
         let device = Device::Cpu;
-        let _aligner = WhisperAligner::load(&device).unwrap();
+        let aligner = WhisperAligner::load(&device).unwrap();
+        println!("Backend: {:?}", aligner.backend);
     }
 }
