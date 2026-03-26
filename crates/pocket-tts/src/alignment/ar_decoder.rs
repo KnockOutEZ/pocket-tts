@@ -406,11 +406,13 @@ impl ARDecoder {
         let hidden = self.ln.forward(&hidden)?;
 
         // Project to vocab (weight tying with token embeddings)
-        // hidden: [1, 1, d_model], embed: [vocab_size, d_model]
-        let logits = hidden.matmul(&self.token_embedding.embeddings().t()?)?;
+        // hidden: [1, 1, d_model] → squeeze to [1, d_model] for matmul
+        let hidden = hidden.squeeze(0)?; // [1, d_model]
+        let embed_t = self.token_embedding.embeddings().t()?; // [d_model, vocab_size]
+        let logits = hidden.matmul(&embed_t)?; // [1, vocab_size]
 
         // Squeeze to [vocab_size]
-        logits.squeeze(0)?.squeeze(0)
+        logits.squeeze(0)
     }
 
     /// Get the accumulated cross-attention weights as `[n_tokens, n_audio_frames]`.
