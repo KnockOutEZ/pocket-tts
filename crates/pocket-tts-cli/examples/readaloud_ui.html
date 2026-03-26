@@ -106,6 +106,8 @@ function tagWords() {
   while (walker.nextNode()) textNodes.push(walker.currentNode);
 
   wordSpans = [];
+  const hasLetterOrDigit = (s) => /[a-zA-Z0-9]/.test(s);
+
   for (const node of textNodes) {
     const text = node.textContent;
     if (!text.trim()) continue;
@@ -117,11 +119,21 @@ function tagWords() {
       if (/^\s+$/.test(part)) {
         frag.appendChild(document.createTextNode(part));
       } else if (part) {
-        const span = document.createElement('span');
-        span.textContent = part;
-        span.dataset.wordIdx = wordSpans.length;
-        wordSpans.push(span);
-        frag.appendChild(span);
+        // If this is pure symbols (—, &, -, ", etc.) with no letters/digits,
+        // attach it to the previous word span so it highlights together
+        if (!hasLetterOrDigit(part) && wordSpans.length > 0) {
+          const prev = wordSpans[wordSpans.length - 1];
+          const symbolSpan = document.createElement('span');
+          symbolSpan.textContent = part;
+          symbolSpan.dataset.wordIdx = prev.dataset.wordIdx;
+          frag.appendChild(symbolSpan);
+        } else {
+          const span = document.createElement('span');
+          span.textContent = part;
+          span.dataset.wordIdx = wordSpans.length;
+          wordSpans.push(span);
+          frag.appendChild(span);
+        }
       }
     }
     node.parentNode.replaceChild(frag, node);
