@@ -176,16 +176,23 @@ async function readAloud() {
 
     for (const ts of tsWords) {
       // Find next editor word that matches (case-insensitive, strip punctuation)
-      const tsClean = ts.word.toLowerCase().replace(/[^a-z']/g, '');
-      while (editorIdx < wordSpans.length) {
-        const edClean = wordSpans[editorIdx].textContent.toLowerCase().replace(/[^a-z']/g, '');
-        if (edClean === tsClean) {
-          mapping.push({ span: wordSpans[editorIdx], start: ts.start, end: ts.end });
-          editorIdx++;
+      // Allow skipping up to 3 editor words to handle mismatches
+      const tsClean = ts.word.toLowerCase().replace(/[^a-z0-9']/g, '');
+      if (!tsClean) continue;
+
+      let matched = false;
+      const maxSkip = Math.min(editorIdx + 5, wordSpans.length);
+      for (let tryIdx = editorIdx; tryIdx < maxSkip; tryIdx++) {
+        const edClean = wordSpans[tryIdx].textContent.toLowerCase().replace(/[^a-z0-9']/g, '');
+        // Exact match, or one starts with the other (handles partial words)
+        if (edClean === tsClean || edClean.startsWith(tsClean) || tsClean.startsWith(edClean)) {
+          mapping.push({ span: wordSpans[tryIdx], start: ts.start, end: ts.end });
+          editorIdx = tryIdx + 1;
+          matched = true;
           break;
         }
-        editorIdx++;
       }
+      // If no match found, skip this timestamp word and keep editorIdx where it is
     }
 
     // Highlight loop
