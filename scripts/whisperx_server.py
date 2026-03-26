@@ -14,10 +14,6 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
-# Pre-import to force loading
-import transformers.pipelines  # noqa: F401
-from transformers import Pipeline  # noqa: F401
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9876)
