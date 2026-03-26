@@ -22,7 +22,7 @@ def main():
     parser.add_argument("audio", help="Input WAV file")
     parser.add_argument("output", help="Output JSON file")
     parser.add_argument("--text", help="Known text (unused for now, WhisperX transcribes)")
-    parser.add_argument("--model", default="small.en", help="Whisper model size")
+    parser.add_argument("--model", default="tiny.en", help="Whisper model size")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 

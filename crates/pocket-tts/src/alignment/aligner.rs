@@ -3,108 +3,124 @@
 //! Uses WhisperX (Whisper + wav2vec2 forced alignment) for production-grade
 //! word-level timestamps (~20-50ms accuracy).
 //!
-//! Backends (auto-detected in order):
-//! 1. Python script (dev: scripts/whisperx_align.py)
-//! 2. Standalone binary (shipped: PyInstaller-compiled whisperx_align)
-//! 3. Docker container (fallback: whisperx-align image)
+//! Primary backend: HTTP server (models loaded once, ~2-4s per alignment).
+//! Auto-starts the server on first use. Fallback: subprocess per call.
 
 use crate::alignment::forced_align::WordTimestamp;
 use crate::audio::resample;
 use candle_core::{Device, Tensor};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::io::Read;
 
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
-
-#[derive(Clone, Debug)]
-enum Backend {
-    /// Python script (requires python3 + whisperx installed)
-    PythonScript(PathBuf),
-    /// Standalone binary (PyInstaller-compiled, no Python needed)
-    Binary(PathBuf),
-    /// Docker container (no local deps needed)
-    Docker(String),
-}
+const SERVER_PORT: u16 = 9876;
 
 /// WhisperX-based aligner for production-grade word timestamps.
+///
+/// Manages a persistent WhisperX server process. Models load once (~10s),
+/// then each alignment takes ~2-4s regardless of hardware.
 #[derive(Clone)]
 pub struct WhisperAligner {
-    backend: Backend,
+    server_script: PathBuf,
+    server_process: std::sync::Arc<Mutex<Option<Child>>>,
 }
 
 impl WhisperAligner {
-    /// Load the aligner. Auto-detects the best available backend.
+    /// Load the aligner. Finds the server script and starts the server.
     pub fn load(_device: &Device) -> anyhow::Result<Self> {
-        let backend = Self::detect_backend()?;
-        Ok(Self { backend })
+        let server_script = Self::find_server_script()?;
+
+        let aligner = Self {
+            server_script,
+            server_process: std::sync::Arc::new(Mutex::new(None)),
+        };
+
+        // Start server eagerly so models load during app startup
+        aligner.ensure_server()?;
+
+        Ok(aligner)
     }
 
-    /// Detect available backend in priority order.
-    fn detect_backend() -> anyhow::Result<Backend> {
-        // 1. Python script (dev mode)
-        let py_candidates = [
-            PathBuf::from("scripts/whisperx_align.py"),
-            PathBuf::from("crates/pocket-tts/scripts/whisperx_align.py"),
-        ];
-        for path in &py_candidates {
-            if path.exists() {
-                // Verify python3 can import whisperx
-                if Command::new("python3")
-                    .args(["-c", "import whisperx"])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-                {
-                    return Ok(Backend::PythonScript(path.clone()));
-                }
-            }
-        }
-
-        // 2. Standalone binary
-        let bin_candidates = [
+    fn find_server_script() -> anyhow::Result<PathBuf> {
+        let candidates = [
+            PathBuf::from("scripts/whisperx_server.py"),
+            PathBuf::from("crates/pocket-tts/scripts/whisperx_server.py"),
+            // Standalone binary (PyInstaller)
             std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(|d| d.join("whisperx_align")))
+                .and_then(|p| p.parent().map(|d| d.join("whisperx_server")))
                 .unwrap_or_default(),
-            PathBuf::from("bin/whisperx_align"),
-            PathBuf::from("crates/pocket-tts/bin/whisperx_align"),
         ];
-        for path in &bin_candidates {
-            if path.exists() {
-                return Ok(Backend::Binary(path.clone()));
-            }
-        }
-        // Check PATH
-        if let Ok(output) = Command::new("which").arg("whisperx_align").output() {
-            if output.status.success() {
-                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() {
-                    return Ok(Backend::Binary(PathBuf::from(p)));
-                }
-            }
-        }
 
-        // 3. Docker
-        if Command::new("docker")
-            .args(["image", "inspect", "whisperx-align"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return Ok(Backend::Docker("whisperx-align".to_string()));
+        for path in &candidates {
+            if path.exists() {
+                return Ok(path.clone());
+            }
         }
 
         anyhow::bail!(
-            "No WhisperX backend found. Options:\n\
-             1. Install whisperx: pip install whisperx (+ scripts/whisperx_align.py)\n\
-             2. Place compiled whisperx_align binary next to your app\n\
-             3. Build Docker image: cd scripts && docker build -f Dockerfile.whisperx -t whisperx-align ."
+            "WhisperX server script not found. Expected scripts/whisperx_server.py"
         )
     }
 
+    /// Start the server if not already running.
+    fn ensure_server(&self) -> anyhow::Result<()> {
+        // Check if server is already responding
+        if self.server_healthy() {
+            return Ok(());
+        }
+
+        let mut proc = self.server_process.lock().unwrap();
+
+        // Kill stale process if any
+        if let Some(ref mut child) = *proc {
+            let _ = child.kill();
+        }
+
+        // Start server
+        let is_py = self.server_script.extension().map_or(false, |e| e == "py");
+        let child = if is_py {
+            Command::new("python3")
+                .arg(&self.server_script)
+                .arg("--port")
+                .arg(SERVER_PORT.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?
+        } else {
+            Command::new(&self.server_script)
+                .arg("--port")
+                .arg(SERVER_PORT.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?
+        };
+
+        *proc = Some(child);
+        drop(proc);
+
+        // Wait for server to be ready (max 60s for model loading)
+        for _ in 0..120 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if self.server_healthy() {
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("WhisperX server failed to start within 60s")
+    }
+
+    fn server_healthy(&self) -> bool {
+        std::net::TcpStream::connect(format!("127.0.0.1:{}", SERVER_PORT)).is_ok()
+    }
+
     /// Align audio to produce word-level timestamps.
-    pub fn align(&self, audio: &Tensor, text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
+    pub fn align(&self, audio: &Tensor, _text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
+        self.ensure_server()?;
+
         // 1. Mono, resample 24kHz → 16kHz
         let audio = match audio.dims().len() {
             1 => audio.unsqueeze(0)?,
@@ -118,7 +134,6 @@ impl WhisperAligner {
         // 2. Write temp WAV
         let tmp_dir = std::env::temp_dir();
         let wav_path = tmp_dir.join("pocket_tts_align.wav");
-        let json_path = tmp_dir.join("pocket_tts_align.json");
         {
             let spec = hound::WavSpec {
                 channels: 1,
@@ -133,45 +148,39 @@ impl WhisperAligner {
             writer.finalize()?;
         }
 
-        // 3. Run alignment via detected backend
-        let output = match &self.backend {
-            Backend::PythonScript(script) => {
-                let mut cmd = Command::new("python3");
-                cmd.arg(script).arg(&wav_path).arg(&json_path);
-                if !text.is_empty() {
-                    cmd.arg("--text").arg(text);
-                }
-                cmd.output()?
-            }
-            Backend::Binary(bin) => {
-                let mut cmd = Command::new(bin);
-                cmd.arg(&wav_path).arg(&json_path);
-                if !text.is_empty() {
-                    cmd.arg("--text").arg(text);
-                }
-                cmd.output()?
-            }
-            Backend::Docker(image) => {
-                let mut cmd = Command::new("docker");
-                cmd.args(["run", "--rm", "-v"]);
-                cmd.arg(format!("{}:{}", tmp_dir.display(), tmp_dir.display()));
-                cmd.arg(image);
-                cmd.arg(&wav_path).arg(&json_path);
-                if !text.is_empty() {
-                    cmd.arg("--text").arg(text);
-                }
-                cmd.output()?
-            }
-        };
+        // 3. POST to server
+        let body = serde_json::json!({ "wav_path": wav_path.to_str() });
+        let body_bytes = serde_json::to_vec(&body)?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("WhisperX alignment failed: {}", stderr);
-        }
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{}", SERVER_PORT))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
 
-        // 4. Parse JSON
-        let json_str = std::fs::read_to_string(&json_path)?;
-        let words: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+        use std::io::Write;
+        write!(
+            stream,
+            "POST /align HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            body_bytes.len()
+        )?;
+        stream.write_all(&body_bytes)?;
+        stream.flush()?;
+
+        // Read response
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        let response_str = String::from_utf8_lossy(&response);
+
+        // Parse HTTP response — find JSON body after headers
+        let body_start = response_str
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(0);
+        let json_body = &response_str[body_start..];
+
+        let words: Vec<serde_json::Value> = serde_json::from_str(json_body)?;
 
         let timestamps: Vec<WordTimestamp> = words
             .iter()
@@ -187,11 +196,23 @@ impl WhisperAligner {
             })
             .collect();
 
-        // 5. Cleanup
+        // Cleanup
         let _ = std::fs::remove_file(&wav_path);
-        let _ = std::fs::remove_file(&json_path);
 
         Ok(timestamps)
+    }
+}
+
+impl Drop for WhisperAligner {
+    fn drop(&mut self) {
+        // Only kill if we're the last reference
+        if std::sync::Arc::strong_count(&self.server_process) == 1 {
+            if let Ok(mut proc) = self.server_process.lock() {
+                if let Some(ref mut child) = *proc {
+                    let _ = child.kill();
+                }
+            }
+        }
     }
 }
 
@@ -204,6 +225,7 @@ mod tests {
     fn test_whisperx_aligner_loads() {
         let device = Device::Cpu;
         let aligner = WhisperAligner::load(&device).unwrap();
-        println!("Backend: {:?}", aligner.backend);
+        println!("Server running on port {}", SERVER_PORT);
+        drop(aligner);
     }
 }
