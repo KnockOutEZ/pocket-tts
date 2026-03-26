@@ -15,7 +15,7 @@ use std::process::Command;
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 const WHISPER_MODEL_REPO: &str = "ggerganov/whisper.cpp";
-const WHISPER_MODEL_FILE: &str = "ggml-base.en.bin";
+const WHISPER_MODEL_FILE: &str = "ggml-small.en.bin";
 
 /// Whisper-based aligner using bundled whisper-cli (whisper.cpp).
 ///

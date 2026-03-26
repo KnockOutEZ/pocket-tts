@@ -76,6 +76,19 @@
 <script>
 function fmt(cmd, val) { document.execCommand(cmd, false, val || null); }
 
+// Simple Levenshtein-like check: are two strings within edit distance 2?
+function levenshteinClose(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return false;
+  if (a.length < 2 || b.length < 2) return a === b;
+  let diff = 0;
+  const minLen = Math.min(a.length, b.length);
+  for (let i = 0; i < minLen; i++) {
+    if (a[i] !== b[i]) diff++;
+    if (diff > 2) return false;
+  }
+  return diff + Math.abs(a.length - b.length) <= 2;
+}
+
 let audio = null;
 let animFrame = null;
 let wordSpans = [];
@@ -174,25 +187,43 @@ async function readAloud() {
     let editorIdx = 0;
     const mapping = []; // { editorSpan, start, end }
 
-    for (const ts of tsWords) {
-      // Find next editor word that matches (case-insensitive, strip punctuation)
-      // Allow skipping up to 3 editor words to handle mismatches
-      const tsClean = ts.word.toLowerCase().replace(/[^a-z0-9']/g, '');
-      if (!tsClean) continue;
+    // Normalize: strip everything except letters/numbers, lowercase
+    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-      let matched = false;
-      const maxSkip = Math.min(editorIdx + 5, wordSpans.length);
-      for (let tryIdx = editorIdx; tryIdx < maxSkip; tryIdx++) {
-        const edClean = wordSpans[tryIdx].textContent.toLowerCase().replace(/[^a-z0-9']/g, '');
-        // Exact match, or one starts with the other (handles partial words)
-        if (edClean === tsClean || edClean.startsWith(tsClean) || tsClean.startsWith(edClean)) {
+    for (const ts of tsWords) {
+      const tsNorm = normalize(ts.word);
+      if (!tsNorm) continue;
+
+      // Look ahead up to 8 editor words for a match.
+      // Wider window handles symbols (&, —, etc.) that Whisper
+      // expands ("&" → "and") or skips entirely.
+      const searchEnd = Math.min(editorIdx + 8, wordSpans.length);
+      for (let tryIdx = editorIdx; tryIdx < searchEnd; tryIdx++) {
+        const edNorm = normalize(wordSpans[tryIdx].textContent);
+        if (!edNorm) {
+          // Empty after normalization (pure punctuation like "&", "—")
+          // Give it the current timestamp so it doesn't get stuck
+          mapping.push({ span: wordSpans[tryIdx], start: ts.start, end: ts.end });
+          continue;
+        }
+        if (edNorm === tsNorm
+            || edNorm.startsWith(tsNorm)
+            || tsNorm.startsWith(edNorm)
+            || levenshteinClose(edNorm, tsNorm)) {
           mapping.push({ span: wordSpans[tryIdx], start: ts.start, end: ts.end });
           editorIdx = tryIdx + 1;
-          matched = true;
           break;
         }
       }
-      // If no match found, skip this timestamp word and keep editorIdx where it is
+    }
+
+    // Map any remaining unmatched editor words to the last timestamp
+    // so highlighting doesn't get stuck
+    if (mapping.length > 0) {
+      const lastTs = mapping[mapping.length - 1];
+      for (let i = editorIdx; i < wordSpans.length; i++) {
+        mapping.push({ span: wordSpans[i], start: lastTs.end, end: lastTs.end + 0.1 });
+      }
     }
 
     // Highlight loop
