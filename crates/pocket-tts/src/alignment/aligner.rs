@@ -1,116 +1,114 @@
-//! Native Whisper aligner for word-level timestamps.
+//! Whisper-based aligner for word-level timestamps.
 //!
-//! Combines timestamp tokens (for segment boundaries / pause preservation) with
-//! DTW on cross-attention weights (for per-word timing within segments). This
-//! matches the approach used by OpenAI's Whisper `--word_timestamps True`.
+//! Uses a bundled whisper-cli binary (whisper.cpp) for accurate word-level
+//! timestamps via DTW on cross-attention weights.
 //!
-//! No Python, no C++ FFI, no external processes. Pure Rust.
+//! No Python required. The whisper-cli binary is a self-contained 2.3MB
+//! native executable. The ggml model (~140MB) downloads on first use.
 
-use crate::alignment::ar_decoder::{ARDecoder, ARDecoderConfig};
-use crate::alignment::dtw_decoder::{dtw_alignment, extract_word_timestamps};
 use crate::alignment::forced_align::WordTimestamp;
 use crate::audio::resample;
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::whisper::{self as w, Config};
-use std::sync::Arc;
-use tokenizers::Tokenizer;
+use candle_core::{Device, Tensor};
+use std::path::PathBuf;
+use std::process::Command;
 
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
-const WHISPER_REPO: &str = "openai/whisper-base.en";
-const HOP_LENGTH: usize = 160;
-const ENCODER_DOWNSAMPLE: usize = 2;
+const WHISPER_MODEL_REPO: &str = "ggerganov/whisper.cpp";
+const WHISPER_MODEL_FILE: &str = "ggml-base.en.bin";
 
-const MEL_FILTERS: &[u8] = include_bytes!("melfilters.bytes");
-
-/// A decoded segment: timestamp-bounded group of text tokens.
-struct Segment {
-    start_sec: f32,
-    end_sec: f32,
-    /// Indices into the full token list (positions of text tokens in this segment)
-    token_positions: Vec<usize>,
-    /// The text token IDs themselves
-    token_ids: Vec<u32>,
-}
-
-/// Native Whisper-based aligner. Segment timestamps + per-segment DTW.
+/// Whisper-based aligner using bundled whisper-cli (whisper.cpp).
+///
+/// Produces word-level timestamps with ~20-50ms accuracy by running
+/// the Whisper model's DTW on cross-attention weights — same algorithm
+/// as OpenAI's Whisper `--word_timestamps True`.
 #[derive(Clone)]
 pub struct WhisperAligner {
-    encoder: Arc<std::sync::Mutex<w::model::Whisper>>,
-    decoder: Arc<std::sync::Mutex<ARDecoder>>,
-    tokenizer: Arc<Tokenizer>,
-    config: Config,
-    device: Device,
-    mel_filters: Vec<f32>,
-    sot_token: u32,
-    eot_token: u32,
-    no_timestamps_token: u32,
-    suppress_tokens: Vec<f32>,
+    whisper_cli: PathBuf,
+    model_path: PathBuf,
 }
 
 impl WhisperAligner {
-    pub fn load(device: &Device) -> anyhow::Result<Self> {
-        let weights_path = crate::weights::download_if_necessary(
-            &format!("hf://{}/model.safetensors", WHISPER_REPO),
-        )?;
-        let config_path = crate::weights::download_if_necessary(
-            &format!("hf://{}/config.json", WHISPER_REPO),
-        )?;
-        let tokenizer_path = crate::weights::download_if_necessary(
-            &format!("hf://{}/tokenizer.json", WHISPER_REPO),
-        )?;
+    /// Load the aligner. Finds the whisper-cli binary and downloads the model.
+    ///
+    /// The `_device` parameter is accepted for API compatibility with TTSModel
+    /// but is unused — whisper-cli manages its own compute.
+    pub fn load(_device: &Device) -> anyhow::Result<Self> {
+        let whisper_cli = Self::find_whisper_cli()?;
+        let model_path = Self::ensure_model()?;
 
-        let config: Config = serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
-
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)?
-        };
-
-        let encoder_model = w::model::Whisper::load(&vb, config.clone())?;
-
-        let ar_config = ARDecoderConfig {
-            d_model: config.d_model,
-            n_head: config.decoder_attention_heads,
-            n_layer: config.decoder_layers,
-            n_vocab: config.vocab_size,
-            n_ctx: config.max_target_positions,
-        };
-        let decoder = ARDecoder::load(vb.pp("model.decoder"), &ar_config)?;
-
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
-
-        let sot_token = token_id(&tokenizer, w::SOT_TOKEN)?;
-        let eot_token = token_id(&tokenizer, w::EOT_TOKEN)?;
-        let no_timestamps_token = token_id(&tokenizer, w::NO_TIMESTAMPS_TOKEN)?;
-
-        let mut suppress_tokens = vec![0f32; config.vocab_size];
-        for &t in &config.suppress_tokens {
-            if (t as usize) < config.vocab_size {
-                suppress_tokens[t as usize] = f32::NEG_INFINITY;
-            }
+        // Verify the binary runs
+        let test = Command::new(&whisper_cli).arg("--help").output();
+        if test.is_err() {
+            anyhow::bail!(
+                "whisper-cli at {:?} failed to execute. \
+                 Rebuild with: cd whisper.cpp && cmake -B build \
+                 -DCMAKE_CROSSCOMPILING=TRUE && cmake --build build",
+                whisper_cli
+            );
         }
 
-        let mut mel_filters = vec![0f32; MEL_FILTERS.len() / 4];
-        byteorder::LittleEndian::read_f32_into(MEL_FILTERS, &mut mel_filters);
-
         Ok(Self {
-            encoder: Arc::new(std::sync::Mutex::new(encoder_model)),
-            decoder: Arc::new(std::sync::Mutex::new(decoder)),
-            tokenizer: Arc::new(tokenizer),
-            config,
-            device: device.clone(),
-            mel_filters,
-            sot_token,
-            eot_token,
-            no_timestamps_token,
-            suppress_tokens,
+            whisper_cli,
+            model_path,
         })
     }
 
-    pub fn align(&self, audio: &Tensor, _text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
-        // 1. Prepare audio
+    /// Find whisper-cli binary. Checks:
+    /// 1. Bundled in crate's bin/ directory
+    /// 2. Next to the running executable
+    /// 3. In PATH
+    fn find_whisper_cli() -> anyhow::Result<PathBuf> {
+        let candidates = [
+            // Bundled (workspace root)
+            PathBuf::from("crates/pocket-tts/bin/whisper-cli"),
+            // Bundled (crate root)
+            PathBuf::from("bin/whisper-cli"),
+            // Next to the running binary (Tauri sidecar)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("whisper-cli")))
+                .unwrap_or_default(),
+        ];
+
+        for path in &candidates {
+            if path.exists() {
+                return Ok(path.clone());
+            }
+        }
+
+        // Check PATH
+        if let Ok(output) = Command::new("which").arg("whisper-cli").output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(PathBuf::from(path));
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "whisper-cli not found. Place it in bin/ or add to PATH.\n\
+             Build: git clone https://github.com/ggerganov/whisper.cpp && \
+             cd whisper.cpp && cmake -B build -DCMAKE_CROSSCOMPILING=TRUE && \
+             cmake --build build --config Release"
+        )
+    }
+
+    fn ensure_model() -> anyhow::Result<PathBuf> {
+        crate::weights::download_if_necessary(&format!(
+            "hf://{}/{}",
+            WHISPER_MODEL_REPO, WHISPER_MODEL_FILE
+        ))
+    }
+
+    /// Align audio to produce word-level timestamps.
+    ///
+    /// `audio`: Tensor `[C, T]` at 24kHz (TTS output).
+    /// `text`: The known text — passed as `--prompt` to guide Whisper's
+    ///         transcription for better word recognition accuracy.
+    pub fn align(&self, audio: &Tensor, text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
+        // 1. Mono, resample 24kHz → 16kHz
         let audio = match audio.dims().len() {
             1 => audio.unsqueeze(0)?,
             2 if audio.dims()[0] == 1 => audio.clone(),
@@ -118,262 +116,137 @@ impl WhisperAligner {
             _ => anyhow::bail!("Unexpected audio shape: {:?}", audio.dims()),
         };
         let audio_16k = resample(&audio, TTS_SAMPLE_RATE, WHISPER_SAMPLE_RATE)?;
-        let pcm: Vec<f32> = audio_16k.flatten_all()?.to_vec1()?;
+        let samples = audio_16k.flatten_all()?.to_vec1::<f32>()?;
 
-        // 2. Mel spectrogram
-        let mel = w::audio::pcm_to_mel(&self.config, &pcm, &self.mel_filters);
-        let mel_len = mel.len() / self.config.num_mel_bins;
-        let mel_tensor = Tensor::from_vec(
-            mel, (1, self.config.num_mel_bins, mel_len), &self.device,
-        )?;
-
-        // 3. Encode
-        let mut encoder = self.encoder.lock().unwrap();
-        encoder.reset_kv_cache();
-        let audio_features = encoder.encoder.forward(&mel_tensor, true)?;
-        drop(encoder);
-
-        // 4. Autoregressive decode (captures cross-attention at each step)
-        let mut decoder = self.decoder.lock().unwrap();
-        decoder.reset_cache();
-
-        let timestamp_begin = self.no_timestamps_token + 1;
-        let first_timestamp = timestamp_begin; // <|0.00|>
-        let mut tokens: Vec<u32> = vec![self.sot_token, first_timestamp];
-
-        // Seed SOT + <|0.00|>
-        let _ = decoder.forward_one(self.sot_token, &audio_features, 0)?;
-        let _ = decoder.forward_one(first_timestamp, &audio_features, 1)?;
-
-        let max_tokens = self.config.max_target_positions / 2;
-        // Force shorter segments: bias toward timestamp tokens after a few text tokens
-        const MAX_TEXT_PER_SEG: usize = 3;
-        const TS_BIAS: f32 = 6.0;
-        let mut text_since_ts: usize = 0;
-
-        for step in 2..max_tokens {
-            let logits = decoder.forward_one(
-                *tokens.last().unwrap(), &audio_features, step,
-            )?;
-
-            let mut logits_vec: Vec<f32> = logits.to_vec1()?;
-            for (i, mask) in self.suppress_tokens.iter().enumerate() {
-                logits_vec[i] += mask;
+        // 2. Write temp WAV (whisper-cli reads from file)
+        let tmp_dir = std::env::temp_dir();
+        let wav_path = tmp_dir.join("pocket_tts_align.wav");
+        let json_stem = tmp_dir.join("pocket_tts_align");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: WHISPER_SAMPLE_RATE,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&wav_path, spec)?;
+            for &s in &samples {
+                writer.write_sample((s * 32767.0).clamp(-32768.0, 32767.0) as i16)?;
             }
-
-            // Bias toward timestamp tokens when segment is getting long
-            if text_since_ts >= MAX_TEXT_PER_SEG {
-                for tok_id in (timestamp_begin as usize)..logits_vec.len() {
-                    logits_vec[tok_id] += TS_BIAS;
-                }
-            }
-
-            let next_token = logits_vec
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(self.eot_token);
-
-            tokens.push(next_token);
-
-            if next_token >= timestamp_begin {
-                text_since_ts = 0;
-            } else if next_token != self.eot_token {
-                text_since_ts += 1;
-            }
-
-            if next_token == self.eot_token {
-                break;
-            }
+            writer.finalize()?;
         }
 
-        // 5. Get full attention matrix [n_steps, n_audio_frames]
-        let attn_matrix = decoder.get_cross_attention_matrix()?;
-        drop(decoder);
+        // 3. Run whisper-cli with --prompt for guided transcription
+        let mut cmd = Command::new(&self.whisper_cli);
+        cmd.arg("-m").arg(&self.model_path)
+            .arg("-f").arg(&wav_path)
+            .arg("--output-json-full")
+            .arg("-of").arg(&json_stem)
+            .arg("-l").arg("en");
 
-        // Trim to actual audio frames
-        let raw_mel_frames = (pcm.len() + HOP_LENGTH - 1) / HOP_LENGTH;
-        let actual_frames = (raw_mel_frames + ENCODER_DOWNSAMPLE - 1) / ENCODER_DOWNSAMPLE;
-        let n_audio = attn_matrix.dim(1)?;
-        let trim = actual_frames.min(n_audio);
-        let attn_matrix = if trim < n_audio {
-            attn_matrix.narrow(1, 0, trim)?
-        } else {
-            attn_matrix
-        };
-
-        // 6. Parse tokens into segments using timestamp tokens
-        let segments = self.parse_segments(&tokens, timestamp_begin);
-
-        // 7. For each segment, run DTW on its portion of the attention matrix
-        let mut all_timestamps = Vec::new();
-
-        for seg in &segments {
-            if seg.token_ids.is_empty() {
-                continue;
-            }
-
-            // Convert segment time to encoder frames
-            let start_frame = sec_to_frame(seg.start_sec);
-            let end_frame = sec_to_frame(seg.end_sec).min(trim);
-
-            if end_frame <= start_frame {
-                continue;
-            }
-
-            // Extract attention sub-matrix for this segment:
-            // rows = text token positions, cols = segment's audio frame range
-            let mut seg_attn_rows: Vec<Vec<f32>> = Vec::new();
-            for &pos in &seg.token_positions {
-                if pos < attn_matrix.dim(0)? {
-                    let row = attn_matrix.get(pos)?;
-                    // Narrow to segment's frame range
-                    let seg_row = row.narrow(0, start_frame, end_frame - start_frame)?;
-                    seg_attn_rows.push(seg_row.to_vec1()?);
-                }
-            }
-
-            if seg_attn_rows.is_empty() {
-                continue;
-            }
-
-            // Preprocess attention (matches OpenAI Whisper pipeline):
-            // 1. Median filter — sharpens peaks, reduces noise
-            median_filter_2d(&mut seg_attn_rows, 3);
-            // 2. Per-row normalization — ensures each token gets fair weight
-            //    (prevents content words from dominating function words)
-            normalize_rows(&mut seg_attn_rows);
-
-            // DTW within this segment
-            let token_alignments = dtw_alignment(&seg_attn_rows);
-
-            // Convert frame offsets to absolute timestamps
-            let seg_timestamps = extract_word_timestamps(
-                &token_alignments, &seg.token_ids, &self.tokenizer,
-            );
-
-            // Offset timestamps by segment start + frame offset
-            for mut ts in seg_timestamps {
-                ts.start_sec += seg.start_sec;
-                ts.end_sec += seg.start_sec;
-                all_timestamps.push(ts);
-            }
+        // Use known text as prompt — improves word recognition accuracy
+        if !text.is_empty() {
+            cmd.arg("--prompt").arg(text);
         }
 
-        Ok(all_timestamps)
+        let output = cmd.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("whisper-cli failed: {}", stderr);
+        }
+
+        // 4. Parse per-token timestamps from JSON, group into words
+        let json_file = json_stem.with_extension("json");
+        let timestamps = Self::parse_word_timestamps(&json_file)?;
+
+        // 5. Cleanup
+        let _ = std::fs::remove_file(&wav_path);
+        let _ = std::fs::remove_file(&json_file);
+
+        Ok(timestamps)
     }
 
-    /// Parse decoded token sequence into segments bounded by timestamp tokens.
-    fn parse_segments(&self, tokens: &[u32], timestamp_begin: u32) -> Vec<Segment> {
-        let mut segments = Vec::new();
-        let mut current_start: Option<f32> = None;
-        let mut current_positions: Vec<usize> = Vec::new();
-        let mut current_ids: Vec<u32> = Vec::new();
+    /// Parse whisper.cpp's JSON output into word timestamps.
+    /// Groups BPE tokens into words using space-prefix convention.
+    fn parse_word_timestamps(json_path: &PathBuf) -> anyhow::Result<Vec<WordTimestamp>> {
+        let json_str = std::fs::read_to_string(json_path)?;
+        let json: serde_json::Value = serde_json::from_str(&json_str)?;
 
-        for (pos, &tok) in tokens.iter().enumerate() {
-            if tok == self.sot_token || tok == self.eot_token {
-                continue;
-            }
+        let mut timestamps = Vec::new();
 
-            if tok >= timestamp_begin {
-                let time_sec = (tok - timestamp_begin) as f32 * 0.02;
+        let transcription = json
+            .get("transcription")
+            .and_then(|t| t.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
 
-                if let Some(start) = current_start {
-                    if !current_ids.is_empty() {
-                        segments.push(Segment {
+        for segment in transcription {
+            let tokens = segment
+                .get("tokens")
+                .and_then(|t| t.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[]);
+
+            let mut word = String::new();
+            let mut word_start: Option<f32> = None;
+            let mut word_end: f32 = 0.0;
+
+            for token in tokens {
+                let text = token.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                if text.is_empty() || text.starts_with('[') {
+                    continue;
+                }
+
+                let offsets = token.get("offsets");
+                let t0 = offsets
+                    .and_then(|o| o.get("from"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32
+                    / 1000.0;
+                let t1 = offsets
+                    .and_then(|o| o.get("to"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32
+                    / 1000.0;
+
+                // Space prefix = new word in Whisper's BPE
+                if text.starts_with(' ') && !word.is_empty() {
+                    if let Some(start) = word_start {
+                        timestamps.push(WordTimestamp {
+                            word: word.clone(),
                             start_sec: start,
-                            end_sec: time_sec,
-                            token_positions: std::mem::take(&mut current_positions),
-                            token_ids: std::mem::take(&mut current_ids),
+                            end_sec: word_end,
                         });
-                    } else {
-                        current_positions.clear();
-                        current_ids.clear();
                     }
+                    word.clear();
+                    word_start = None;
                 }
-                current_start = Some(time_sec);
-            } else {
-                // Text token
-                current_positions.push(pos);
-                current_ids.push(tok);
+
+                let clean = text.trim();
+                if !clean.is_empty() {
+                    if word.is_empty() {
+                        word = clean.to_string();
+                        word_start = Some(t0);
+                    } else {
+                        word.push_str(clean);
+                    }
+                    word_end = t1;
+                }
+            }
+
+            // Emit final word in segment
+            if !word.is_empty() {
+                if let Some(start) = word_start {
+                    timestamps.push(WordTimestamp {
+                        word,
+                        start_sec: start,
+                        end_sec: word_end,
+                    });
+                }
             }
         }
 
-        segments
-    }
-}
-
-/// Convert seconds to encoder frame index.
-fn sec_to_frame(sec: f32) -> usize {
-    // Each encoder frame = HOP_LENGTH * ENCODER_DOWNSAMPLE samples at 16kHz
-    // = 320 samples = 20ms
-    let samples = (sec * WHISPER_SAMPLE_RATE as f32) as usize;
-    samples / (HOP_LENGTH * ENCODER_DOWNSAMPLE)
-}
-
-use byteorder::ByteOrder;
-
-fn token_id(tokenizer: &Tokenizer, token: &str) -> anyhow::Result<u32> {
-    tokenizer
-        .token_to_id(token)
-        .ok_or_else(|| anyhow::anyhow!("Token '{}' not found in vocabulary", token))
-}
-
-/// Apply 2D median filter to attention matrix (in-place).
-/// This matches OpenAI Whisper's `medfilt` preprocessing before DTW.
-/// Sharpens attention peaks and removes noise, improving alignment accuracy.
-fn median_filter_2d(matrix: &mut [Vec<f32>], kernel_size: usize) {
-    if matrix.is_empty() || matrix[0].is_empty() || kernel_size <= 1 {
-        return;
-    }
-
-    let rows = matrix.len();
-    let cols = matrix[0].len();
-    let half = kernel_size / 2;
-
-    // Filter along columns (time axis) for each row
-    let mut buf = vec![0f32; kernel_size];
-    for row in matrix.iter_mut() {
-        let orig = row.clone();
-        for j in 0..cols {
-            let start = j.saturating_sub(half);
-            let end = (j + half + 1).min(cols);
-            let len = end - start;
-            buf[..len].copy_from_slice(&orig[start..end]);
-            buf[..len].sort_unstable_by(|a, b| a.total_cmp(b));
-            row[j] = buf[len / 2];
-        }
-    }
-
-    // Filter along rows (token axis) for each column
-    for j in 0..cols {
-        let orig: Vec<f32> = (0..rows).map(|i| matrix[i][j]).collect();
-        for i in 0..rows {
-            let start = i.saturating_sub(half);
-            let end = (i + half + 1).min(rows);
-            let len = end - start;
-            buf[..len].copy_from_slice(&orig[start..end]);
-            buf[..len].sort_unstable_by(|a, b| a.total_cmp(b));
-            matrix[i][j] = buf[len / 2];
-        }
-    }
-}
-
-/// Normalize each row to zero mean, unit variance.
-/// Ensures every token has equal weight in DTW regardless of attention magnitude.
-fn normalize_rows(matrix: &mut [Vec<f32>]) {
-    for row in matrix.iter_mut() {
-        if row.is_empty() {
-            continue;
-        }
-        let n = row.len() as f32;
-        let mean: f32 = row.iter().sum::<f32>() / n;
-        let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
-        let std = (var + 1e-8).sqrt();
-        for x in row.iter_mut() {
-            *x = (*x - mean) / std;
-        }
+        Ok(timestamps)
     }
 }
 

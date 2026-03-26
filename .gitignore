@@ -90,4 +90,6 @@ profile_output*
 CLAUDE.md
 QWEN.md
 .claude/
-temp-candle/
+temp-candle/crates/pocket-tts-cli/examples/readaloud_demo.rs
+crates/pocket-tts-cli/examples/readaloud_ui.html
+crates/pocket-tts/bin/
