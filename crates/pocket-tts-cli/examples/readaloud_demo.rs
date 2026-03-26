@@ -1,6 +1,10 @@
-//! Read-aloud demo: rich text editor with word-level highlight sync.
+//! Read-aloud demo: mirrors the Tauri app lifecycle.
 //!
-//! Run: cargo run -p pocket-tts-cli --example readaloud_demo
+//! 1. Preload all weights (first run downloads, subsequent: instant check)
+//! 2. Load TTS + start WhisperX server (simulates "open book")
+//! 3. Serve UI — click "Read Aloud" and it just works, no loading lag
+//!
+//! Run: cargo run -p pocket-tts-cli --example readaloud_demo --no-default-features --release
 //! Then open http://localhost:3033
 
 use anyhow::Result;
@@ -39,10 +43,15 @@ struct WordTs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    eprintln!("Loading TTS + alignment models...");
+    // === Step 1: Preload (like Tauri app startup) ===
+    eprintln!("[1/3] Checking/downloading all models and voices...");
+    TTSModel::preload_weights("b6369a24", TTSModel::VOICES)?;
+
+    // === Step 2: Load into memory + start WhisperX server (like "open book") ===
+    eprintln!("[2/3] Loading TTS model + starting WhisperX server...");
     let model = TTSModel::load_with_alignment("b6369a24")?;
 
-    eprintln!("Loading alba voice...");
+    eprintln!("[3/3] Loading voice...");
     let voice_path = pocket_tts::weights::download_if_necessary(&format!(
         "hf://{}/embeddings/alba.safetensors",
         VOICE_REPO
@@ -57,7 +66,9 @@ async fn main() -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    eprintln!("\n  Ready at http://localhost:3033\n");
+    eprintln!("\n  Everything loaded. Ready at http://localhost:3033");
+    eprintln!("  Click 'Read Aloud' — no loading lag, just generate + play.\n");
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3033").await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -72,7 +83,6 @@ async fn generate(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Run generation on blocking thread (CPU-bound)
     let state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         state.model.generate_with_timestamps(&text, &state.voice_state)
@@ -84,7 +94,6 @@ async fn generate(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Encode audio as WAV base64
     let audio_data = result.audio.flatten_all()
         .and_then(|t| t.to_vec1::<f32>())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
