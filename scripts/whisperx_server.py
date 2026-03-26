@@ -102,7 +102,14 @@ def main():
         def log_message(self, format, *args):
             pass  # Suppress request logs
 
-    server = HTTPServer(("127.0.0.1", args.port), Handler)
+    import socket
+    class ReusableHTTPServer(HTTPServer):
+        allow_reuse_address = True
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            super().server_bind()
+
+    server = ReusableHTTPServer(("127.0.0.1", args.port), Handler)
     server.serve_forever()
 
 if __name__ == "__main__":
