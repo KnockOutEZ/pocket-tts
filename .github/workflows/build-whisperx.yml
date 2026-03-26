@@ -60,12 +60,13 @@ jobs:
             scripts/whisperx_server.py
         shell: bash
 
-      - name: Rename binary
+      - name: Compress binary
         run: |
+          cd dist
           if [ "${{ matrix.target }}" = "windows-x64" ]; then
-            mv dist/whisperx_server.exe dist/whisperx_server-${{ matrix.target }}.exe
+            7z a -mx9 whisperx_server-${{ matrix.target }}.zip whisperx_server.exe
           else
-            mv dist/whisperx_server dist/whisperx_server-${{ matrix.target }}
+            tar czf whisperx_server-${{ matrix.target }}.tar.gz whisperx_server
           fi
         shell: bash
 
@@ -73,7 +74,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: whisperx_server-${{ matrix.target }}
-          path: dist/whisperx_server-*
+          path: dist/whisperx_server-${{ matrix.target }}.*
 
   release:
     needs: build
@@ -91,18 +92,18 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: artifacts/**/*
           body: |
             ## WhisperX Sidecar Binaries
 
             Pre-built WhisperX alignment server for pocket-tts.
 
-            Download the binary for your platform and place it next to your app executable.
-            The binary includes Python + PyTorch + WhisperX — no external dependencies needed.
+            Download for your platform, extract, and place next to your app executable.
+            Includes Python + PyTorch + WhisperX — no external dependencies needed.
 
-            | Platform | Binary |
-            |----------|--------|
-            | macOS ARM64 (M1/M2/M3) | `whisperx_server-macos-arm64` |
-            | macOS Intel | `whisperx_server-macos-x64` |
-            | Linux x64 | `whisperx_server-linux-x64` |
-            | Windows x64 | `whisperx_server-windows-x64.exe` |
+            | Platform | File |
+            |----------|------|
+            | macOS ARM64 (M1/M2/M3) | `whisperx_server-macos-arm64.tar.gz` |
+            | macOS Intel | `whisperx_server-macos-x64.tar.gz` |
+            | Linux x64 | `whisperx_server-linux-x64.tar.gz` |
+            | Windows x64 | `whisperx_server-windows-x64.zip` |
