@@ -43,33 +43,39 @@ jobs:
       - name: Install dependencies
         run: |
           pip install whisperx pyinstaller
-          pip install transformers tokenizers huggingface-hub torchcodec
+          pip install transformers tokenizers huggingface-hub
+          # torchcodec may not have wheels for all platforms — install if available
+          pip install torchcodec || echo "torchcodec not available for this platform, skipping"
 
       - name: Build standalone binary
         run: |
-          pyinstaller \
-            --onefile \
-            --name whisperx_server \
-            --collect-all whisperx \
-            --collect-all faster_whisper \
-            --collect-all ctranslate2 \
-            --collect-all pyannote \
-            --collect-all transformers \
-            --collect-all tokenizers \
-            --copy-metadata torch \
-            --copy-metadata torchaudio \
-            --copy-metadata torchcodec \
-            --copy-metadata transformers \
-            --copy-metadata tokenizers \
-            --copy-metadata huggingface-hub \
-            --copy-metadata safetensors \
-            --copy-metadata faster-whisper \
-            --copy-metadata ctranslate2 \
-            --copy-metadata whisperx \
-            --copy-metadata pyannote-audio \
-            --copy-metadata pyannote-core \
-            --copy-metadata pyannote-pipeline \
-            scripts/whisperx_server.py
+          # Build base args
+          ARGS="--onefile --name whisperx_server"
+          ARGS="$ARGS --collect-all whisperx"
+          ARGS="$ARGS --collect-all faster_whisper"
+          ARGS="$ARGS --collect-all ctranslate2"
+          ARGS="$ARGS --collect-all pyannote"
+          ARGS="$ARGS --collect-all transformers"
+          ARGS="$ARGS --collect-all tokenizers"
+          ARGS="$ARGS --copy-metadata torch"
+          ARGS="$ARGS --copy-metadata torchaudio"
+          ARGS="$ARGS --copy-metadata transformers"
+          ARGS="$ARGS --copy-metadata tokenizers"
+          ARGS="$ARGS --copy-metadata huggingface-hub"
+          ARGS="$ARGS --copy-metadata safetensors"
+          ARGS="$ARGS --copy-metadata faster-whisper"
+          ARGS="$ARGS --copy-metadata ctranslate2"
+          ARGS="$ARGS --copy-metadata whisperx"
+          ARGS="$ARGS --copy-metadata pyannote-audio"
+          ARGS="$ARGS --copy-metadata pyannote-core"
+          ARGS="$ARGS --copy-metadata pyannote-pipeline"
+
+          # torchcodec: collect if installed (may not be available on all platforms)
+          if python -c "import torchcodec" 2>/dev/null; then
+            ARGS="$ARGS --collect-all torchcodec --copy-metadata torchcodec"
+          fi
+
+          pyinstaller $ARGS scripts/whisperx_server.py
         shell: bash
 
       - name: Compress binary

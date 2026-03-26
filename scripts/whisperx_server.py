@@ -14,6 +14,17 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
+# Patch: torchcodec may not be available on all platforms.
+# transformers checks for it via importlib.metadata.version() and crashes if missing.
+# This makes the check return gracefully instead of crashing.
+import importlib.metadata
+_orig_dist = importlib.metadata.distribution
+def _safe_dist(name):
+    if name == "torchcodec":
+        raise importlib.metadata.PackageNotFoundError(name)
+    return _orig_dist(name)
+importlib.metadata.distribution = _safe_dist
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9876)
