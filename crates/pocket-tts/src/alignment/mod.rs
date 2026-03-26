@@ -1,6 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod aligner;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod ar_decoder;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dtw_decoder;
 pub mod forced_align;
 
