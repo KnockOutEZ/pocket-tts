@@ -113,4 +113,6 @@ def main():
     server.serve_forever()
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()  # Required for PyInstaller on macOS
     main()
