@@ -54,26 +54,32 @@ impl WhisperAligner {
         Ok(())
     }
 
-    /// Download WhisperX models (Whisper + wav2vec2) without starting the server.
-    /// Call during app startup to ensure all models are cached.
+    /// Ensure WhisperX models are cached. Instant if already downloaded.
+    /// Only downloads (~15-20s) on first run or if cache is corrupted.
     pub fn preload_models() -> anyhow::Result<()> {
         let script = Self::find_server_script()?;
 
-        let is_py = script.extension().map_or(false, |e| e == "py");
-        let output = if is_py {
-            Command::new("python3")
-                .arg(&script)
-                .arg("--preload")
-                .output()?
-        } else {
-            Command::new(&script)
-                .arg("--preload")
-                .output()?
+        let run = |args: &[&str]| -> anyhow::Result<std::process::Output> {
+            let is_py = script.extension().map_or(false, |e| e == "py");
+            if is_py {
+                Ok(Command::new("python3").arg(&script).args(args).output()?)
+            } else {
+                Ok(Command::new(&script).args(args).output()?)
+            }
         };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("WhisperX model preload failed: {}", stderr);
+        // Fast check: are models already cached? (instant)
+        let check = run(&["--check"])?;
+        if check.status.success() {
+            return Ok(()); // All cached, nothing to do
+        }
+
+        // Models missing — download them (slow, first time only)
+        eprintln!("  WhisperX models not cached, downloading...");
+        let preload = run(&["--preload"])?;
+        if !preload.status.success() {
+            let stderr = String::from_utf8_lossy(&preload.stderr);
+            anyhow::bail!("WhisperX model download failed: {}", stderr);
         }
 
         Ok(())
