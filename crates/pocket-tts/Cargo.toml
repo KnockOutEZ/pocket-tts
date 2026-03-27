@@ -51,6 +51,9 @@ memmap2.workspace = true
 # Using tokenizers crate's built-in SentencePiece support instead
 tokenizers = { workspace = true, features = ["onig", "progressbar", "http"] }
 intel-mkl-src.workspace = true
+ort = { version = "=2.0.0-rc.12", features = ["load-dynamic"] }
+ndarray = "0.16"
+dirs = "6"
 
 # WASM-specific dependencies
 [target.'cfg(target_arch = "wasm32")'.dependencies]
