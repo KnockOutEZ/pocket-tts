@@ -16,7 +16,8 @@ use std::io::Read;
 
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
-const SERVER_PORT: u16 = 9876;
+const SERVER_PORT_START: u16 = 9876;
+const SERVER_PORT_RANGE: u16 = 20; // try ports 9876-9895
 
 /// WhisperX-based aligner for production-grade word timestamps.
 ///
@@ -25,6 +26,7 @@ const SERVER_PORT: u16 = 9876;
 #[derive(Clone)]
 pub struct WhisperAligner {
     server_script: PathBuf,
+    server_port: std::sync::Arc<Mutex<u16>>,
     server_process: std::sync::Arc<Mutex<Option<Child>>>,
 }
 
@@ -35,6 +37,7 @@ impl WhisperAligner {
 
         let aligner = Self {
             server_script,
+            server_port: std::sync::Arc::new(Mutex::new(SERVER_PORT_START)),
             server_process: std::sync::Arc::new(Mutex::new(None)),
         };
 
@@ -98,6 +101,24 @@ impl WhisperAligner {
         )
     }
 
+    /// Find a port that isn't already in use.
+    fn find_free_port() -> anyhow::Result<u16> {
+        for port in SERVER_PORT_START..(SERVER_PORT_START + SERVER_PORT_RANGE) {
+            if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
+                return Ok(port);
+            }
+        }
+        anyhow::bail!(
+            "No free port found in range {}-{}",
+            SERVER_PORT_START,
+            SERVER_PORT_START + SERVER_PORT_RANGE - 1
+        )
+    }
+
+    fn get_port(&self) -> u16 {
+        *self.server_port.lock().unwrap()
+    }
+
     /// Start the server if not already running.
     fn ensure_server(&self) -> anyhow::Result<()> {
         // Check if server is already responding
@@ -112,20 +133,24 @@ impl WhisperAligner {
             let _ = child.kill();
         }
 
-        // Start server — inherit stderr so we see errors, null stdout to prevent pipe blocking
+        // Find a free port
+        let port = Self::find_free_port()?;
+        *self.server_port.lock().unwrap() = port;
+
+        // Start server
         let is_py = self.server_script.extension().map_or(false, |e| e == "py");
         let child = if is_py {
             Command::new("python3")
                 .arg(&self.server_script)
                 .arg("--port")
-                .arg(SERVER_PORT.to_string())
+                .arg(port.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()?
         } else {
             Command::new(&self.server_script)
                 .arg("--port")
-                .arg(SERVER_PORT.to_string())
+                .arg(port.to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()?
@@ -159,7 +184,7 @@ impl WhisperAligner {
     }
 
     fn server_healthy(&self) -> bool {
-        std::net::TcpStream::connect(format!("127.0.0.1:{}", SERVER_PORT)).is_ok()
+        std::net::TcpStream::connect(format!("127.0.0.1:{}", self.get_port())).is_ok()
     }
 
     /// Align audio to produce word-level timestamps.
@@ -197,7 +222,7 @@ impl WhisperAligner {
         let body = serde_json::json!({ "wav_path": wav_path.to_str() });
         let body_bytes = serde_json::to_vec(&body)?;
 
-        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{}", SERVER_PORT))?;
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{}", self.get_port()))?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
 
         use std::io::Write;
