@@ -259,6 +259,46 @@ pub fn resample_linear(audio: &Tensor, from_rate: u32, to_rate: u32) -> anyhow::
     resample(audio, from_rate, to_rate)
 }
 
+/// Resample audio for alignment (Cubic polynomial — faster, sufficient for CTC alignment).
+/// The main `resample()` uses Septic for TTS quality. This is separate to avoid degrading TTS output.
+pub fn resample_for_alignment(audio: &Tensor, from_rate: u32, to_rate: u32) -> anyhow::Result<Tensor> {
+    if from_rate == to_rate {
+        return Ok(audio.clone());
+    }
+
+    let shape = audio.dims();
+    let channels = shape[0];
+    let num_samples = shape[1];
+
+    if num_samples == 0 {
+        return Ok(audio.clone());
+    }
+
+    use rubato::{FastFixedIn, Resampler};
+
+    let ratio = to_rate as f64 / from_rate as f64;
+    let audio_vec = audio.to_vec2::<f32>()?;
+
+    let mut resampler = FastFixedIn::<f32>::new(
+        ratio,
+        1.0,
+        rubato::PolynomialDegree::Cubic, // Cubic — faster, sufficient for alignment
+        num_samples,
+        channels,
+    )?;
+
+    let resampled_vec = resampler.process(&audio_vec, None)?;
+    let out_channels = resampled_vec.len();
+    let out_samples = resampled_vec[0].len();
+
+    let mut flat_data = Vec::with_capacity(out_channels * out_samples);
+    for channel in resampled_vec {
+        flat_data.extend(channel);
+    }
+
+    Ok(Tensor::from_vec(flat_data, (out_channels, out_samples), audio.device())?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +382,22 @@ mod tests {
         assert!(diff < 1e-3, "Diff was {}", diff);
 
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_resample_for_alignment_24k_to_16k() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        // 24000 samples = 1 second at 24kHz
+        let samples: Vec<f32> = (0..24000).map(|i| (i as f32 * 0.001).sin()).collect();
+        let audio = Tensor::from_vec(samples, (1, 24000), &device)?;
+
+        let resampled = resample_for_alignment(&audio, 24000, 16000)?;
+        let shape = resampled.dims();
+        assert_eq!(shape[0], 1); // mono
+        // Should be approximately 16000 samples (rubato may vary slightly)
+        assert!(shape[1] > 15500 && shape[1] < 16500,
+            "Expected ~16000 samples, got {}", shape[1]);
         Ok(())
     }
 }

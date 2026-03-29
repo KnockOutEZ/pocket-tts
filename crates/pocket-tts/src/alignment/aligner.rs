@@ -301,7 +301,7 @@ mod tests {
     fn test_whisperx_aligner_loads() {
         let device = Device::Cpu;
         let aligner = WhisperAligner::load(&device).unwrap();
-        println!("Server running on port {}", SERVER_PORT);
+        println!("Server running on port {}", SERVER_PORT_START);
         drop(aligner);
     }
 }
