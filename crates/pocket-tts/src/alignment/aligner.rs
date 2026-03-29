@@ -1,295 +1,231 @@
-//! WhisperX-based aligner for word-level timestamps.
+//! Native ONNX-based aligner for word-level timestamps.
 //!
-//! Uses WhisperX (Whisper + wav2vec2 forced alignment) for production-grade
-//! word-level timestamps (~20-50ms accuracy).
-//!
-//! Primary backend: HTTP server (models loaded once, ~2-4s per alignment).
-//! Auto-starts the server on first use. Fallback: subprocess per call.
+//! Uses wav2vec2 (quantized ONNX) + Viterbi forced alignment for
+//! word-level timestamps (~20-50ms accuracy). No Python dependency.
 
-use crate::alignment::forced_align::WordTimestamp;
-use crate::audio::resample;
+use crate::alignment::forced_align::{
+    path_to_word_timestamps, text_to_ctc_targets, viterbi_forced_align, WordTimestamp,
+};
 use candle_core::{Device, Tensor};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::io::Read;
+use ort::session::builder::GraphOptimizationLevel;
+use ort::session::Session;
+use ort::value::Tensor as OrtTensor;
+use std::sync::{Arc, Mutex};
 
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
-const SERVER_PORT_START: u16 = 9876;
-const SERVER_PORT_RANGE: u16 = 20; // try ports 9876-9895
+const FRAME_DURATION_SEC: f32 = 0.02;
+const ALIGNMENT_REPO: &str = "KnockOutEZ/pocket-tts-alignment";
+const ONNX_FILENAME: &str = "wav2vec2-large-int8.onnx";
+const VOCAB_FILENAME: &str = "vocab.json";
 
-/// WhisperX-based aligner for production-grade word timestamps.
+/// Native ONNX-based aligner for production-grade word timestamps.
 ///
-/// Manages a persistent WhisperX server process. Models load once (~10s),
-/// then each alignment takes ~2-4s regardless of hardware.
+/// Uses a quantized wav2vec2 model for CTC emissions and Viterbi
+/// forced alignment to map text characters to audio frames.
 #[derive(Clone)]
-pub struct WhisperAligner {
-    server_script: PathBuf,
-    server_port: std::sync::Arc<Mutex<u16>>,
-    server_process: std::sync::Arc<Mutex<Option<Child>>>,
+pub struct NativeAligner {
+    session: Arc<Mutex<Session>>,
+    vocab: Vec<String>,
+    blank_id: usize,
 }
 
-impl WhisperAligner {
-    /// Load the aligner. Finds the server script and starts the server.
+impl NativeAligner {
+    /// Load the aligner. Downloads the ONNX model + vocab if not cached,
+    /// then creates an ORT inference session.
     pub fn load(_device: &Device) -> anyhow::Result<Self> {
-        let server_script = Self::find_server_script()?;
+        let onnx_path = crate::weights::download_if_necessary(&format!(
+            "hf://{}/{}",
+            ALIGNMENT_REPO, ONNX_FILENAME
+        ))?;
+        let vocab_path = crate::weights::download_if_necessary(&format!(
+            "hf://{}/{}",
+            ALIGNMENT_REPO, VOCAB_FILENAME
+        ))?;
 
-        let aligner = Self {
-            server_script,
-            server_port: std::sync::Arc::new(Mutex::new(SERVER_PORT_START)),
-            server_process: std::sync::Arc::new(Mutex::new(None)),
-        };
+        let mut builder = Session::builder()
+            .map_err(|e| anyhow::anyhow!("Failed to create ORT session builder: {}", e))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("Failed to set optimization level: {}", e))?;
+        let session = builder
+            .commit_from_file(&onnx_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load ONNX model: {}", e))?;
 
-        // Start server eagerly so models load during app startup
-        aligner.ensure_server()?;
+        let vocab_json: serde_json::Value =
+            serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(&vocab_path)?))?;
 
-        Ok(aligner)
+        // vocab.json is { "a": 1, "b": 2, ... } -- invert to index->token
+        let map = vocab_json
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("vocab.json is not a JSON object"))?;
+
+        let max_id = map.values().filter_map(|v| v.as_u64()).max().unwrap_or(0) as usize;
+        let mut vocab = vec![String::new(); max_id + 1];
+        let mut blank_id = 0usize;
+
+        for (token, id_val) in map {
+            let id = id_val.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("vocab.json value for '{}' is not an integer", token)
+            })? as usize;
+            // Normalize special tokens
+            let normalized = match token.as_str() {
+                "|" => " ".to_string(),
+                t => t.to_lowercase(),
+            };
+            if token == "<pad>" {
+                blank_id = id;
+            }
+            if id < vocab.len() {
+                vocab[id] = normalized;
+            }
+        }
+
+        Ok(Self {
+            session: Arc::new(Mutex::new(session)),
+            vocab,
+            blank_id,
+        })
     }
 
-    /// Check if the WhisperX backend is available (script or binary exists).
-    /// Does NOT start the server or load models.
+    /// Check if the alignment model files are already cached locally.
+    /// Does NOT download anything or create an ORT session.
     pub fn check_available() -> anyhow::Result<()> {
-        Self::find_server_script()?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        let cache_root = home.join(".cache").join("huggingface").join("hub");
+        let repo_dir = cache_root.join(format!(
+            "models--{}",
+            ALIGNMENT_REPO.replace('/', "--")
+        ));
+
+        if !repo_dir.exists() {
+            anyhow::bail!(
+                "Alignment model not cached. Run preload_models() first. Expected: {:?}",
+                repo_dir
+            );
+        }
         Ok(())
     }
 
-    /// Ensure WhisperX models are cached. Instant if already downloaded.
-    /// Only downloads (~15-20s) on first run or if cache is corrupted.
+    /// Download model + vocab if not already cached. Instant if cached.
     pub fn preload_models() -> anyhow::Result<()> {
-        let script = Self::find_server_script()?;
-
-        let run = |args: &[&str]| -> anyhow::Result<std::process::Output> {
-            let is_py = script.extension().map_or(false, |e| e == "py");
-            if is_py {
-                Ok(Command::new("python3").arg(&script).args(args).output()?)
-            } else {
-                Ok(Command::new(&script).args(args).output()?)
-            }
-        };
-
-        // Fast check: are models already cached? (instant)
-        let check = run(&["--check"])?;
-        if check.status.success() {
-            return Ok(()); // All cached, nothing to do
-        }
-
-        // Models missing — download them (slow, first time only)
-        eprintln!("  WhisperX models not cached, downloading...");
-        let preload = run(&["--preload"])?;
-        if !preload.status.success() {
-            let stderr = String::from_utf8_lossy(&preload.stderr);
-            anyhow::bail!("WhisperX model download failed: {}", stderr);
-        }
-
+        crate::weights::download_if_necessary(&format!(
+            "hf://{}/{}",
+            ALIGNMENT_REPO, ONNX_FILENAME
+        ))?;
+        crate::weights::download_if_necessary(&format!(
+            "hf://{}/{}",
+            ALIGNMENT_REPO, VOCAB_FILENAME
+        ))?;
         Ok(())
-    }
-
-    fn find_server_script() -> anyhow::Result<PathBuf> {
-        let candidates = [
-            PathBuf::from("scripts/whisperx_server.py"),
-            PathBuf::from("crates/pocket-tts/scripts/whisperx_server.py"),
-            // Standalone binary (PyInstaller)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("whisperx_server")))
-                .unwrap_or_default(),
-        ];
-
-        for path in &candidates {
-            if path.exists() {
-                return Ok(path.clone());
-            }
-        }
-
-        anyhow::bail!(
-            "WhisperX server script not found. Expected scripts/whisperx_server.py"
-        )
-    }
-
-    /// Find a port that isn't already in use.
-    fn find_free_port() -> anyhow::Result<u16> {
-        for port in SERVER_PORT_START..(SERVER_PORT_START + SERVER_PORT_RANGE) {
-            if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
-                return Ok(port);
-            }
-        }
-        anyhow::bail!(
-            "No free port found in range {}-{}",
-            SERVER_PORT_START,
-            SERVER_PORT_START + SERVER_PORT_RANGE - 1
-        )
-    }
-
-    fn get_port(&self) -> u16 {
-        *self.server_port.lock().unwrap()
-    }
-
-    /// Start the server if not already running.
-    fn ensure_server(&self) -> anyhow::Result<()> {
-        // Check if server is already responding
-        if self.server_healthy() {
-            return Ok(());
-        }
-
-        let mut proc = self.server_process.lock().unwrap();
-
-        // Kill stale process if any
-        if let Some(ref mut child) = *proc {
-            let _ = child.kill();
-        }
-
-        // Find a free port
-        let port = Self::find_free_port()?;
-        *self.server_port.lock().unwrap() = port;
-
-        // Start server
-        let is_py = self.server_script.extension().map_or(false, |e| e == "py");
-        let child = if is_py {
-            Command::new("python3")
-                .arg(&self.server_script)
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()?
-        } else {
-            Command::new(&self.server_script)
-                .arg("--port")
-                .arg(port.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()?
-        };
-
-        let child_id = child.id();
-        *proc = Some(child);
-        drop(proc);
-
-        // Wait for server to be ready (max 300s for model loading on slow machines)
-        for i in 0..600 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if self.server_healthy() {
-                return Ok(());
-            }
-            // Check if process died
-            if i % 10 == 0 {
-                let mut proc = self.server_process.lock().unwrap();
-                if let Some(ref mut child) = *proc {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        anyhow::bail!(
-                            "WhisperX server exited with status {} (pid {})",
-                            status, child_id
-                        );
-                    }
-                }
-            }
-        }
-
-        anyhow::bail!("WhisperX server failed to start within 300s (pid {})", child_id)
-    }
-
-    fn server_healthy(&self) -> bool {
-        std::net::TcpStream::connect(format!("127.0.0.1:{}", self.get_port())).is_ok()
     }
 
     /// Align audio to produce word-level timestamps.
-    pub fn align(&self, audio: &Tensor, _text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
-        self.ensure_server()?;
+    ///
+    /// Pipeline: normalize mono -> resample 24kHz->16kHz -> ONNX inference ->
+    /// log-softmax -> CTC targets -> Viterbi -> word timestamps.
+    pub fn align(&self, audio: &Tensor, text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
 
-        // 1. Mono, resample 24kHz → 16kHz
+        // 1. Normalize to mono [1, N]
         let audio = match audio.dims().len() {
             1 => audio.unsqueeze(0)?,
             2 if audio.dims()[0] == 1 => audio.clone(),
             2 => audio.mean(0)?.unsqueeze(0)?,
             _ => anyhow::bail!("Unexpected audio shape: {:?}", audio.dims()),
         };
-        let audio_16k = resample(&audio, TTS_SAMPLE_RATE, WHISPER_SAMPLE_RATE)?;
-        let samples = audio_16k.flatten_all()?.to_vec1::<f32>()?;
 
-        // 2. Write temp WAV
-        let tmp_dir = std::env::temp_dir();
-        let wav_path = tmp_dir.join("pocket_tts_align.wav");
-        {
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: WHISPER_SAMPLE_RATE,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-            let mut writer = hound::WavWriter::create(&wav_path, spec)?;
-            for &s in &samples {
-                writer.write_sample((s * 32767.0).clamp(-32768.0, 32767.0) as i16)?;
+        // 2. Ensure CPU
+        let audio = audio.to_device(&Device::Cpu)?;
+
+        // 3. Resample 24kHz -> 16kHz
+        let audio_16k =
+            crate::audio::resample_for_alignment(&audio, TTS_SAMPLE_RATE, WHISPER_SAMPLE_RATE)?;
+
+        // 4. Extract f32 samples
+        let samples = audio_16k.flatten_all()?.to_vec1::<f32>()?;
+        let num_samples = samples.len();
+
+        // 5. Build ONNX input [1, num_samples]
+        let input_value = OrtTensor::from_array(([1usize, num_samples], samples.into_boxed_slice()))
+            .map_err(|e| anyhow::anyhow!("Failed to create ORT input tensor: {}", e))?;
+
+        // 6. Run inference + extract logits (scoped to release session lock)
+        let emissions = {
+            let mut session = self.session.lock().unwrap();
+            let outputs = session
+                .run(ort::inputs![input_value])
+                .map_err(|e| anyhow::anyhow!("ONNX inference failed: {}", e))?;
+
+            // 7. Extract logits and apply log-softmax per frame
+            let (shape, logits_data) = outputs[0]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow::anyhow!("Failed to extract logits: {}", e))?;
+
+            // shape is [1, T, vocab_size]
+            let t_len = shape[1] as usize;
+            let vocab_size = shape[2] as usize;
+
+            let mut emissions: Vec<Vec<f32>> = Vec::with_capacity(t_len);
+            for t in 0..t_len {
+                let offset = t * vocab_size;
+                let mut frame: Vec<f32> = logits_data[offset..offset + vocab_size].to_vec();
+
+                // Log-softmax: log(exp(x_i) / sum(exp(x_j)))
+                let max_val = frame.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum_exp: f32 = frame.iter().map(|&x| (x - max_val).exp()).sum();
+                let log_sum_exp = max_val + sum_exp.ln();
+                for val in &mut frame {
+                    *val -= log_sum_exp;
+                }
+                emissions.push(frame);
             }
-            writer.finalize()?;
+            emissions
+        };
+
+        // 8. Normalize text for alignment
+        let normalized = normalize_for_alignment(text);
+        if normalized.is_empty() {
+            return Ok(vec![]);
         }
 
-        // 3. POST to server
-        let body = serde_json::json!({ "wav_path": wav_path.to_str() });
-        let body_bytes = serde_json::to_vec(&body)?;
+        // 9. CTC targets -> Viterbi -> word timestamps
+        let targets = text_to_ctc_targets(&normalized, &self.vocab, self.blank_id);
+        let path = viterbi_forced_align(&emissions, &targets)?;
+        let words = path_to_word_timestamps(
+            &path,
+            &normalized,
+            &self.vocab,
+            self.blank_id,
+            FRAME_DURATION_SEC,
+        );
 
-        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{}", self.get_port()))?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
-
-        use std::io::Write;
-        write!(
-            stream,
-            "POST /align HTTP/1.1\r\n\
-             Host: 127.0.0.1\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             \r\n",
-            body_bytes.len()
-        )?;
-        stream.write_all(&body_bytes)?;
-        stream.flush()?;
-
-        // Read response
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        let response_str = String::from_utf8_lossy(&response);
-
-        // Parse HTTP response — find JSON body after headers
-        let body_start = response_str
-            .find("\r\n\r\n")
-            .map(|i| i + 4)
-            .unwrap_or(0);
-        let json_body = &response_str[body_start..];
-
-        let words: Vec<serde_json::Value> = serde_json::from_str(json_body)?;
-
-        let timestamps: Vec<WordTimestamp> = words
-            .iter()
-            .filter_map(|w| {
-                let word = w.get("word")?.as_str()?.to_string();
-                let start = w.get("start")?.as_f64()? as f32;
-                let end = w.get("end")?.as_f64()? as f32;
-                Some(WordTimestamp {
-                    word,
-                    start_sec: start,
-                    end_sec: end,
-                })
-            })
-            .collect();
-
-        // Cleanup
-        let _ = std::fs::remove_file(&wav_path);
-
-        Ok(timestamps)
+        Ok(words)
     }
 }
 
-impl Drop for WhisperAligner {
-    fn drop(&mut self) {
-        // Only kill if we're the last reference
-        if std::sync::Arc::strong_count(&self.server_process) == 1 {
-            if let Ok(mut proc) = self.server_process.lock() {
-                if let Some(ref mut child) = *proc {
-                    let _ = child.kill();
-                }
+/// Normalize text for CTC alignment: lowercase, keep only a-z/space/apostrophe,
+/// collapse whitespace.
+fn normalize_for_alignment(text: &str) -> String {
+    let filtered: String = text
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphabetic() {
+                Some(c.to_ascii_lowercase())
+            } else if c == '\'' {
+                Some('\'')
+            } else if c.is_whitespace() || c == '-' {
+                Some(' ')
+            } else {
+                None
             }
-        }
-    }
+        })
+        .collect();
+
+    // Collapse multiple spaces into one, trim
+    filtered.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -297,11 +233,19 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore]
-    fn test_whisperx_aligner_loads() {
-        let device = Device::Cpu;
-        let aligner = WhisperAligner::load(&device).unwrap();
-        println!("Server running on port {}", SERVER_PORT_START);
-        drop(aligner);
+    fn test_normalize_for_alignment() {
+        assert_eq!(normalize_for_alignment("Hello, World!"), "hello world");
+        assert_eq!(normalize_for_alignment("I'm fine."), "i'm fine");
+        assert_eq!(
+            normalize_for_alignment("  multiple   spaces  "),
+            "multiple spaces"
+        );
+        assert_eq!(normalize_for_alignment("self-driving"), "self driving");
+        assert_eq!(normalize_for_alignment("123!@#"), "");
+        assert_eq!(normalize_for_alignment(""), "");
+        assert_eq!(
+            normalize_for_alignment("UPPER lower MiXeD"),
+            "upper lower mixed"
+        );
     }
 }

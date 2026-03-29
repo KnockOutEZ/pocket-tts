@@ -48,7 +48,7 @@ pub struct TTSModel {
     pub device: Device,
     /// Optional alignment model for word timestamps
     #[cfg(not(target_arch = "wasm32"))]
-    pub aligner: Option<crate::alignment::WhisperAligner>,
+    pub aligner: Option<crate::alignment::NativeAligner>,
 }
 
 /// Result of generation with word-level timestamps.
@@ -1181,7 +1181,7 @@ impl TTSModel {
 
         // 4. WhisperX models (Whisper + wav2vec2) — download without starting server
         eprintln!("[4/4] Checking WhisperX alignment models...");
-        crate::alignment::WhisperAligner::preload_models()?;
+        crate::alignment::NativeAligner::preload_models()?;
 
         eprintln!("All models ready.");
         Ok(())
@@ -1198,7 +1198,7 @@ impl TTSModel {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_with_alignment(variant: &str) -> Result<Self> {
         let mut model = Self::load(variant)?;
-        let aligner = crate::alignment::WhisperAligner::load(&model.device)?;
+        let aligner = crate::alignment::NativeAligner::load(&model.device)?;
         model.aligner = Some(aligner);
         Ok(model)
     }
