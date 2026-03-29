@@ -137,6 +137,107 @@ pub fn viterbi_forced_align(
     Ok(path)
 }
 
+/// Convert a frame-level alignment path to word-level timestamps.
+///
+/// - `path`: per-frame token IDs (length T)
+/// - `text`: the original text that was aligned
+/// - `vocab`: vocabulary (index → token string)
+/// - `blank_id`: the blank token index
+/// - `frame_duration`: duration of one frame in seconds (0.02 for 50fps)
+pub fn path_to_word_timestamps(
+    path: &[usize],
+    text: &str,
+    vocab: &[String],
+    blank_id: usize,
+    frame_duration: f32,
+) -> Vec<WordTimestamp> {
+    if path.is_empty() || text.is_empty() {
+        return vec![];
+    }
+
+    // Collect (char, first_frame, last_frame) for each non-blank character
+    let mut char_spans: Vec<(char, usize, usize)> = Vec::new();
+
+    // Walk path and extract character spans.
+    // Track token transitions — a new span starts when:
+    // - we go from blank to non-blank, OR
+    // - the non-blank token ID changes (skip-blank Viterbi transition)
+    let text_chars: Vec<char> = text.chars().filter(|c| {
+        let key = c.to_lowercase().to_string();
+        vocab.iter().any(|v| v == &key)
+    }).collect();
+
+    let mut char_idx = 0;
+    let mut prev_token: Option<usize> = None;
+    let mut first_frame = 0usize;
+
+    for (frame, &token_id) in path.iter().enumerate() {
+        if token_id == blank_id {
+            // Close previous span if any
+            if let Some(_prev) = prev_token {
+                if char_idx < text_chars.len() {
+                    char_spans.push((text_chars[char_idx], first_frame, frame - 1));
+                    char_idx += 1;
+                }
+                prev_token = None;
+            }
+        } else {
+            match prev_token {
+                None => {
+                    // Start new span
+                    first_frame = frame;
+                    prev_token = Some(token_id);
+                }
+                Some(prev) if prev != token_id => {
+                    // Token changed without blank — close previous, start new
+                    if char_idx < text_chars.len() {
+                        char_spans.push((text_chars[char_idx], first_frame, frame - 1));
+                        char_idx += 1;
+                    }
+                    first_frame = frame;
+                    prev_token = Some(token_id);
+                }
+                _ => {
+                    // Same token continues
+                }
+            }
+        }
+    }
+    // Handle last character if path ends on a non-blank
+    if prev_token.is_some() && char_idx < text_chars.len() {
+        char_spans.push((text_chars[char_idx], first_frame, path.len() - 1));
+    }
+
+    // Group characters into words by splitting on space
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut timestamps = Vec::new();
+    let mut span_idx = 0;
+
+    for word in &words {
+        let word_char_count = word.chars().filter(|c| {
+            let key = c.to_lowercase().to_string();
+            vocab.iter().any(|v| v == &key)
+        }).count();
+
+        if word_char_count == 0 || span_idx + word_char_count > char_spans.len() {
+            continue;
+        }
+
+        let word_start_frame = char_spans[span_idx].1;
+        let word_end_frame = char_spans[span_idx + word_char_count - 1].2;
+
+        timestamps.push(WordTimestamp {
+            word: word.to_string(),
+            start_sec: word_start_frame as f32 * frame_duration,
+            end_sec: (word_end_frame + 1) as f32 * frame_duration,
+        });
+
+        span_idx += word_char_count;
+    }
+
+    timestamps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +364,38 @@ mod tests {
         let targets = vec![0, 1, 0, 2, 0];
         let result = viterbi_forced_align(&emissions, &targets);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_path_to_words_simple() {
+        let vocab = test_vocab();
+        // Path for "hi": blank(0), blank(0), h(8), h(8), i(9), blank(0)
+        // 6 frames at 20ms each
+        let path = vec![0, 0, 8, 8, 9, 0];
+        let words = path_to_word_timestamps(&path, "hi", &vocab, 0, 0.02);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "hi");
+        assert!((words[0].start_sec - 0.04).abs() < 0.001); // frame 2
+        assert!((words[0].end_sec - 0.10).abs() < 0.001);   // frame 4+1
+    }
+
+    #[test]
+    fn test_path_to_words_two_words() {
+        let vocab = test_vocab();
+        // "a b": blank, a, blank, space, blank, b, blank
+        // Path: 0, 1, 1, 27, 0, 2, 2, 0
+        let path = vec![0, 1, 1, 27, 0, 2, 2, 0];
+        let words = path_to_word_timestamps(&path, "a b", &vocab, 0, 0.02);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "a");
+        assert_eq!(words[1].word, "b");
+        assert!(words[0].end_sec <= words[1].start_sec);
+    }
+
+    #[test]
+    fn test_path_to_words_empty_path() {
+        let vocab = test_vocab();
+        let words = path_to_word_timestamps(&[], "", &vocab, 0, 0.02);
+        assert!(words.is_empty());
     }
 }
