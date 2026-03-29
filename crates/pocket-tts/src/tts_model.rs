@@ -1150,7 +1150,7 @@ impl TTSModel {
     /// - TTS model weights (~90MB)
     /// - TTS tokenizer (~2MB)
     /// - ALL voice embeddings (~5MB each)
-    /// - WhisperX models: Whisper tiny.en (~75MB) + wav2vec2-base (~360MB)
+    /// - Alignment model: wav2vec2-large ONNX INT8 (~320MB)
     ///
     /// Pass a callback to report progress to the UI.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1179,8 +1179,8 @@ impl TTSModel {
             crate::weights::download_if_necessary(&voice_path)?;
         }
 
-        // 4. WhisperX models (Whisper + wav2vec2) — download without starting server
-        eprintln!("[4/4] Checking WhisperX alignment models...");
+        // 4. ONNX alignment model (wav2vec2-large INT8)
+        eprintln!("[4/4] Checking alignment model (ONNX wav2vec2)...");
         crate::alignment::NativeAligner::preload_models()?;
 
         eprintln!("All models ready.");
@@ -1193,7 +1193,7 @@ impl TTSModel {
     ];
 
     /// Load TTS model + alignment model together.
-    /// Starts the WhisperX server (models load ~15s on first call).
+    /// Loads the ONNX alignment model (~2-3s).
     /// Call this when the user opens a book.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_with_alignment(variant: &str) -> Result<Self> {
