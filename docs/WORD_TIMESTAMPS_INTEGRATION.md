@@ -2,7 +2,7 @@
 
 ## Overview
 
-pocket-tts fork (`feat/word-timestamps` branch) provides TTS audio generation with word-level timestamps for read-aloud apps. Uses WhisperX (Whisper transcription + wav2vec2-base forced alignment) for ~20-50ms accuracy. No customer-facing Python dependency — the WhisperX server is compiled into a standalone sidecar binary via CI.
+pocket-tts fork (`feat/word-timestamps` branch) provides TTS audio generation with word-level timestamps for read-aloud apps. Uses native ONNX inference (wav2vec2-large-960h-lv60-self INT8) + pure Rust Viterbi forced alignment for ~20-50ms accuracy. No Python dependency — alignment runs entirely in-process.
 
 ## Repository Setup
 
@@ -32,13 +32,10 @@ pocket-tts = { git = "https://github.com/KnockOutEZ/pocket-tts.git", branch = "f
 pocket-tts (TTS fork):
   1. Make changes, push to feat/word-timestamps
   2. Tag: git tag v0.7.x && git push origin v0.7.x
-  3. CI builds WhisperX sidecar binaries (macOS ARM64/x64, Windows, Linux)
-  4. Download artifacts from GitHub Actions
 
 vordetta-tauri (Tauri app):
   1. cargo update -p pocket-tts  (pulls latest from git)
-  2. Place whisperx_server binary in src-tauri/bin/
-  3. Build Tauri app: cargo tauri build
+  2. Build Tauri app: cargo tauri build
 ```
 
 When pocket-tts is stable, you can pin to a specific commit:
@@ -59,29 +56,26 @@ pocket-tts = { git = "ssh://git@github.com/KnockOutEZ/pocket-tts.git", rev = "ab
 │  └─ Show "Setting up..." UI with progress           │
 │                                                     │
 │  User Opens Book                                    │
-│  ├─ load_with_alignment()  → load TTS + start       │
-│  │   WhisperX server (~15s)                         │
+│  ├─ load_with_alignment()  → load TTS + load        │
+│  │   wav2vec2 ONNX model into memory (~5-8s)        │
 │  └─ Show "Loading..." until ready                   │
 │                                                     │
 │  User Reads (per sentence pipeline)                 │
-│  ├─ generate_sentence_with_timestamps()  (~3-5s)    │
+│  ├─ generate_sentence_with_timestamps()  (~1.5-3s)  │
 │  ├─ Play sentence N audio                           │
 │  ├─ Highlight words using timestamps                │
 │  └─ While N plays, generate N+1 in background       │
 │                                                     │
 │  User Closes Book                                   │
-│  └─ drop(model)  → kills server, frees memory       │
+│  └─ drop(model)  → frees TTS + ONNX model memory   │
 └─────────────────────────────────────────────────────┘
 
 Internal flow of generate_sentence_with_timestamps():
   1. Pocket TTS generates audio (Candle, ~1-3s)
-  2. Audio resampled 24kHz → 16kHz
-  3. Written as temp WAV
-  4. POST to WhisperX server (localhost:9876)
-  5. WhisperX: Whisper transcribes → wav2vec2 force-aligns
-  6. Server returns JSON word timestamps (~2s)
-  7. Temp WAV cleaned up
-  8. Return GenerationResult { audio, word_timestamps }
+  2. Audio resampled 24kHz → 16kHz (Cubic polynomial)
+  3. wav2vec2-large ONNX Runtime inference → CTC emission probabilities (~300-500ms)
+  4. Viterbi forced alignment against known text (pure Rust, <1ms)
+  5. Return GenerationResult { audio, word_timestamps }
 ```
 
 ---
@@ -91,7 +85,7 @@ Internal flow of generate_sentence_with_timestamps():
 ### Phase 1: First App Launch (Downloads)
 
 ```rust
-// Call on EVERY app startup. First run downloads ~530MB.
+// Call on EVERY app startup. First run downloads ~450MB.
 // Subsequent runs: instant cache check.
 // Show progress UI during first run.
 
@@ -101,9 +95,7 @@ TTSModel::preload_weights("b6369a24", TTSModel::VOICES)?;
 //   [1/4] TTS model weights        ~90MB   (hf-hub cache)
 //   [2/4] TTS tokenizer            ~2MB    (hf-hub cache)
 //   [3/4] ALL voice embeddings     ~40MB   (8 voices × ~5MB each)
-//   [4/4] WhisperX models          ~435MB  (Whisper tiny.en + wav2vec2-base)
-//         - whisper tiny.en         ~75MB  (torch hub cache)
-//         - wav2vec2-base           ~360MB (torch hub cache)
+//   [4/4] wav2vec2-large ONNX      ~320MB  (INT8 quantized, hf-hub cache)
 ```
 
 Available voices: `TTSModel::VOICES` = `["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]`
@@ -111,8 +103,8 @@ Available voices: `TTSModel::VOICES` = `["alba", "marius", "javert", "jean", "fa
 ### Phase 2: User Opens a Book
 
 ```rust
-// Load TTS into memory + start WhisperX HTTP server.
-// Takes ~15s (model loading). Show "Opening book..." UI.
+// Load TTS into memory + load wav2vec2 ONNX model.
+// Takes ~5-8s (model loading). Show "Opening book..." UI.
 // ZERO downloads — everything cached from Phase 1.
 
 let model = TTSModel::load_with_alignment("b6369a24")?;
@@ -127,7 +119,7 @@ let voice_state = model.get_voice_state_from_prompt_file(&voice_path)?;
 ### Phase 3: Reading (Per-Sentence Pipeline)
 
 ```rust
-// ~3-5s per sentence. Play while generating next.
+// ~1.5-3s per sentence. Play while generating next.
 let result = model.generate_sentence_with_timestamps(sentence, &voice_state)?;
 
 // result.audio: candle_core::Tensor [C, T] at 24kHz
@@ -137,22 +129,21 @@ let result = model.generate_sentence_with_timestamps(sentence, &voice_state)?;
 
 **Pipeline pattern:**
 ```
-Sentence 1: generate (3s) → play + highlight
-Sentence 2: generate (3s, in background while 1 plays) → play + highlight
-Sentence 3: generate (3s, in background while 2 plays) → play + highlight
+Sentence 1: generate (1.5-3s) → play + highlight
+Sentence 2: generate (1.5-3s, in background while 1 plays) → play + highlight
+Sentence 3: generate (1.5-3s, in background while 2 plays) → play + highlight
 ...
 ```
 
-User hears continuous audio with synchronized word highlighting. The ~3-5s generation time is hidden by the pipeline.
+User hears continuous audio with synchronized word highlighting. The ~1.5-3s generation time is hidden by the pipeline.
 
 ### Phase 4: User Closes Book
 
 ```rust
 drop(model);
 // Automatically:
-//   - Kills WhisperX server process
 //   - Frees TTS model memory (~300MB)
-//   - WhisperX memory freed when process dies (~500MB)
+//   - Frees ONNX Runtime / wav2vec2 model memory (~150-250MB)
 ```
 
 ---
@@ -170,7 +161,7 @@ pub struct GenerationResult {
 }
 
 pub struct WordTimestamp {
-    pub word: String,     // Word as transcribed by Whisper
+    pub word: String,     // Word as provided in input text
     pub start_sec: f32,   // Start time in seconds
     pub end_sec: f32,     // End time in seconds
 }
@@ -184,14 +175,14 @@ impl TTSModel {
     pub const VOICES: &[&str];
 
     /// Download/verify all models. Call on every app startup.
-    /// First run: ~530MB download. Subsequent: instant cache check.
+    /// First run: ~450MB download. Subsequent: instant cache check.
     pub fn preload_weights(variant: &str, voices: &[&str]) -> Result<()>;
 
-    /// Load TTS + start WhisperX server. Call when user opens a book.
-    /// ~15s for model loading. Zero downloads.
+    /// Load TTS + load wav2vec2 ONNX model. Call when user opens a book.
+    /// ~5-8s for model loading. Zero downloads.
     pub fn load_with_alignment(variant: &str) -> Result<Self>;
 
-    /// Generate audio for one sentence with word timestamps. ~3-5s.
+    /// Generate audio for one sentence with word timestamps. ~1.5-3s.
     pub fn generate_sentence_with_timestamps(
         &self, sentence: &str, voice_state: &ModelState
     ) -> Result<GenerationResult>;
@@ -321,7 +312,7 @@ async fn speak_sentence(
 #[tauri::command]
 async fn close_book(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
     let mut s = state.lock().unwrap();
-    s.model = None;       // Drops model, kills WhisperX server
+    s.model = None;       // Drops model, frees TTS + ONNX model memory
     s.voice_state = None;
     Ok(())
 }
@@ -367,65 +358,20 @@ async function readSentence(sentence) {
 
 ---
 
-## WhisperX Sidecar Binary
-
-### What It Is
-
-A standalone executable (~400-500MB) containing Python + PyTorch + WhisperX. No Python installation needed on customer machines. Built by CI via PyInstaller.
-
-### How It's Found
-
-The aligner auto-detects backends in order:
-1. `scripts/whisperx_server.py` — dev mode (requires Python + whisperx pip package)
-2. `whisperx_server` binary next to running executable — shipped Tauri app
-3. `whisperx_server` in PATH
-
-### CI Build
-
-GitHub Actions workflow: `.github/workflows/build-whisperx.yml`
-
-Builds for: macOS ARM64, macOS x64, Windows x64, Linux x64
-
-Trigger: push a `v*` tag or manual dispatch from Actions page.
-
-Download artifacts from: GitHub Actions → workflow run → Artifacts section.
-
-### Tauri Sidecar Placement
-
-```
-src-tauri/
-  bin/
-    whisperx_server-aarch64-apple-darwin    ← macOS ARM64
-    whisperx_server-x86_64-apple-darwin     ← macOS Intel
-    whisperx_server-x86_64-pc-windows-msvc.exe  ← Windows
-    whisperx_server-x86_64-unknown-linux-gnu    ← Linux
-```
-
-Tauri's `tauri.conf.json`:
-```json
-{
-  "bundle": {
-    "externalBin": ["bin/whisperx_server"]
-  }
-}
-```
-
----
-
 ## Performance
 
 | Phase | Time | Memory | Notes |
 |-------|------|--------|-------|
 | App startup (preload) | First: ~60s download. Subsequent: <1s | Minimal | Cache check only |
-| Open book | ~15s | +800MB | TTS (~300MB) + WhisperX server (~500MB) |
-| Per sentence | ~3-5s | No change | 1-3s TTS + 2s alignment |
-| Close book | Instant | -800MB | Server killed, models freed |
+| Open book | ~5-8s | +450-550MB | TTS (~300MB) + wav2vec2 ONNX (~150-250MB) |
+| Per sentence | ~1.5-3s | No change | 1-3s TTS + 300-500ms alignment |
+| Close book | Instant | -450-550MB | Models freed |
 
 ### Customer Machine Requirements
 
 - macOS 12+, Windows 10+, or Linux (glibc 2.31+)
 - 4GB RAM minimum (8GB recommended)
-- 1.5GB disk for models (downloaded once, cached)
+- ~1.2GB disk for models (downloaded once, cached)
 - Internet for first-run model download
 
 ---
@@ -434,18 +380,14 @@ Tauri's `tauri.conf.json`:
 
 ```
 pocket-tts/
-├── .github/workflows/
-│   └── build-whisperx.yml              # CI: PyInstaller builds
 ├── scripts/
-│   ├── whisperx_server.py              # WhisperX HTTP server (dev + PyInstaller source)
-│   ├── whisperx_align.py               # Standalone alignment script
-│   ├── Dockerfile.whisperx             # Docker fallback
-│   └── test_whisperx.py                # Comparison test
+│   └── export_wav2vec2_onnx.py         # One-time ONNX export script
 ├── crates/pocket-tts/
 │   ├── src/alignment/
 │   │   ├── mod.rs                      # Module declarations
-│   │   ├── aligner.rs                  # WhisperAligner (server client)
-│   │   └── forced_align.rs             # WordTimestamp type
+│   │   ├── aligner.rs                  # NativeAligner (ONNX inference)
+│   │   └── forced_align.rs             # Viterbi algorithm + WordTimestamp
+│   ├── src/audio.rs                    # +resample_for_alignment (Cubic polynomial)
 │   ├── src/tts_model.rs                # +preload_weights, +VOICES,
 │   │                                   #  +load_with_alignment,
 │   │                                   #  +generate_sentence_with_timestamps,

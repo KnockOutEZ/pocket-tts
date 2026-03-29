@@ -1,3 +1,31 @@
+## Native ONNX Alignment (replacing WhisperX)
+
+**What changed:** Replaced the WhisperX Python sidecar server with in-process ONNX inference (wav2vec2-large-960h-lv60-self INT8) + pure Rust Viterbi forced alignment.
+
+**Why:** WhisperX ran Whisper transcription (redundant — we already know the text), took 2-4s per sentence, required Python/PyTorch (~500MB process), and needed a PyInstaller binary for distribution.
+
+**New approach:** Since we know the text, skip ASR entirely. Run wav2vec2-large through ONNX Runtime to get CTC emission probabilities, then Viterbi-align against known text.
+
+| Metric | Before (WhisperX) | After (Native ONNX) |
+|--------|-------------------|---------------------|
+| Alignment latency | 2-4s | ~300-500ms |
+| Download size | ~530MB | ~450MB |
+| Model load time | ~15s | ~5-8s |
+| Memory | ~800MB | ~450-550MB |
+| Python required | Yes | No |
+
+**Files added/changed:**
+- `crates/pocket-tts/src/alignment/aligner.rs` — rewritten: NativeAligner with ONNX inference
+- `crates/pocket-tts/src/alignment/forced_align.rs` — Viterbi algorithm + CTC target builder + path-to-word-timestamps
+- `crates/pocket-tts/src/audio.rs` — added `resample_for_alignment` (Cubic polynomial)
+- `scripts/export_wav2vec2_onnx.py` — one-time ONNX export script
+
+**Files deleted:**
+- `scripts/whisperx_server.py`
+- `.github/workflows/build-whisperx.yml`
+
+---
+
 # Word-Level Timestamps — Branch Summary
 
 **Branch:** `feat/word-timestamps`
