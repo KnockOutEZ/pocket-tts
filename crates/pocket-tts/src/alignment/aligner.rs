@@ -248,4 +248,70 @@ mod tests {
             "upper lower mixed"
         );
     }
+
+    #[test]
+    #[ignore] // Requires ONNX model + TTS model downloads
+    fn test_native_aligner_full_pipeline() {
+        // This test requires the ONNX model AND TTS model to be downloaded.
+        // Run with: HF_TOKEN=xxx cargo test --release -- test_native_aligner_full_pipeline --ignored
+
+        let device = candle_core::Device::Cpu;
+
+        // Load TTS model and generate real speech
+        let model = crate::tts_model::TTSModel::load("b6369a24").unwrap();
+        let voice_path = crate::weights::download_if_necessary(
+            "hf://kyutai/pocket-tts-without-voice-cloning/embeddings/alba.safetensors",
+        )
+        .unwrap();
+        let voice_state = model.get_voice_state_from_prompt_file(&voice_path).unwrap();
+        let text = "Hello world, this is a test.";
+        let audio = model.generate(text, &voice_state).unwrap();
+
+        // Load aligner and align
+        let aligner = super::NativeAligner::load(&device).unwrap();
+        let timestamps = aligner.align(&audio, text).unwrap();
+
+        // Spec-required assertions:
+        // 1. Every word has start < end
+        for ts in &timestamps {
+            assert!(
+                ts.start_sec < ts.end_sec,
+                "Word '{}' has start_sec ({}) >= end_sec ({})",
+                ts.word, ts.start_sec, ts.end_sec
+            );
+        }
+
+        // 2. Timestamps are monotonically increasing
+        for i in 1..timestamps.len() {
+            assert!(
+                timestamps[i].start_sec >= timestamps[i - 1].start_sec,
+                "Timestamps not monotonic: '{}' starts at {} before '{}' at {}",
+                timestamps[i].word, timestamps[i].start_sec,
+                timestamps[i - 1].word, timestamps[i - 1].start_sec
+            );
+        }
+
+        // 3. Total duration matches audio length within 200ms
+        if let Some(last) = timestamps.last() {
+            let audio_duration = audio.dims().last().copied().unwrap_or(0) as f32 / 24000.0;
+            assert!(
+                last.end_sec <= audio_duration + 0.2,
+                "Last timestamp end ({}) exceeds audio duration ({}) by >200ms",
+                last.end_sec, audio_duration
+            );
+        }
+
+        // 4. Word count matches (normalized text)
+        let expected_words: Vec<&str> = normalize_for_alignment(text)
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            timestamps.len(),
+            expected_words.len(),
+            "Expected {} words, got {}. Words: {:?}",
+            expected_words.len(),
+            timestamps.len(),
+            timestamps.iter().map(|t| &t.word).collect::<Vec<_>>()
+        );
+    }
 }
