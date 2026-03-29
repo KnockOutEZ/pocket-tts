@@ -302,7 +302,8 @@ mod tests {
         }
 
         // 4. Word count matches (normalized text)
-        let expected_words: Vec<&str> = normalize_for_alignment(text)
+        let normalized = normalize_for_alignment(text);
+        let expected_words: Vec<&str> = normalized
             .split_whitespace()
             .collect();
         assert_eq!(
