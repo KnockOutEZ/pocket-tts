@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 const TTS_SAMPLE_RATE: u32 = 24000;
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 const FRAME_DURATION_SEC: f32 = 0.02;
-const ALIGNMENT_REPO: &str = "KnockOutEZ/pocket-tts-alignment";
+const ALIGNMENT_REPO: &str = "towhid/pocket-tts-alignment";
 const ONNX_FILENAME: &str = "wav2vec2-large-int8.onnx";
 const VOCAB_FILENAME: &str = "vocab.json";
 
