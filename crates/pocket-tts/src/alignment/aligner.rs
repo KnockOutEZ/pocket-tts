@@ -124,6 +124,11 @@ impl NativeAligner {
     ///
     /// Pipeline: normalize mono -> resample 24kHz->16kHz -> ONNX inference ->
     /// log-softmax -> CTC targets -> Viterbi -> word timestamps.
+    ///
+    /// Returns one `WordTimestamp` per word in the **original** text (preserving
+    /// the original word form). Words that normalize to empty (e.g. numbers,
+    /// symbols) receive interpolated timestamps so that index-based highlighting
+    /// in the consumer stays in sync.
     pub fn align(&self, audio: &Tensor, text: &str) -> anyhow::Result<Vec<WordTimestamp>> {
         if text.is_empty() {
             return Ok(vec![]);
@@ -191,10 +196,10 @@ impl NativeAligner {
             return Ok(vec![]);
         }
 
-        // 9. CTC targets -> Viterbi -> word timestamps
+        // 9. CTC targets -> Viterbi -> word timestamps (on normalized text)
         let targets = text_to_ctc_targets(&normalized, &self.vocab, self.blank_id);
         let path = viterbi_forced_align(&emissions, &targets)?;
-        let words = path_to_word_timestamps(
+        let aligned_words = path_to_word_timestamps(
             &path,
             &normalized,
             &self.vocab,
@@ -202,7 +207,49 @@ impl NativeAligner {
             FRAME_DURATION_SEC,
         );
 
-        Ok(words)
+        // 10. Map aligned (normalized) words back to original text words.
+        //     Words whose normalization is empty (numbers, symbols) get
+        //     interpolated timestamps so index-based highlighting stays in sync.
+        let original_words: Vec<&str> = text.split_whitespace().collect();
+        let mut result: Vec<WordTimestamp> = Vec::with_capacity(original_words.len());
+        let mut aligned_idx = 0;
+
+        for orig_word in &original_words {
+            let norm = normalize_for_alignment(orig_word);
+            if norm.is_empty() {
+                // This word has no alignable characters (e.g. "123", "&", "--").
+                // Interpolate: use the end of the previous word or start of the
+                // next aligned word so highlighting doesn't jump.
+                let t = if aligned_idx > 0 && aligned_idx - 1 < aligned_words.len() {
+                    let prev = &aligned_words[aligned_idx - 1];
+                    prev.end_sec
+                } else if aligned_idx < aligned_words.len() {
+                    aligned_words[aligned_idx].start_sec
+                } else if let Some(last) = result.last() {
+                    last.end_sec
+                } else {
+                    0.0
+                };
+                result.push(WordTimestamp {
+                    word: orig_word.to_string(),
+                    start_sec: t,
+                    end_sec: t,
+                });
+            } else {
+                // Normal word — consume the next aligned word, but keep the
+                // original surface form for the consumer.
+                if aligned_idx < aligned_words.len() {
+                    result.push(WordTimestamp {
+                        word: orig_word.to_string(),
+                        start_sec: aligned_words[aligned_idx].start_sec,
+                        end_sec: aligned_words[aligned_idx].end_sec,
+                    });
+                    aligned_idx += 1;
+                }
+            }
+        }
+
+        Ok(result)
     }
 }
 

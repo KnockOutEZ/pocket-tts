@@ -1152,24 +1152,45 @@ impl TTSModel {
     /// - ALL voice embeddings (~5MB each)
     /// - Alignment model: wav2vec2-large ONNX INT8 (~320MB)
     ///
-    /// Pass a callback to report progress to the UI.
+    /// Pre-download all model files so first inference is fast.
+    ///
+    /// Set `word_timestamps` to `false` on low-spec devices or Android to skip
+    /// downloading the ~300MB wav2vec2 ONNX alignment model. The app can still
+    /// generate audio and do sentence-level highlighting without it.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn preload_weights(variant: &str, voices: &[&str]) -> Result<()> {
+        Self::preload_weights_with_options(variant, voices, true)
+    }
+
+    /// Pre-download model files with control over optional components.
+    ///
+    /// When `word_timestamps` is `false`, the ~300MB ONNX alignment model is
+    /// not downloaded. Use `TTSModel::load()` (not `load_with_alignment()`)
+    /// at runtime — `generate_sentence_with_timestamps` will return empty
+    /// `word_timestamps` and the caller handles sentence-level highlighting.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn preload_weights_with_options(
+        variant: &str,
+        voices: &[&str],
+        word_timestamps: bool,
+    ) -> Result<()> {
+        let total_steps = if word_timestamps { 4 } else { 3 };
+
         // 1. TTS config + weights
         let config_path = find_config_path(variant)?;
         let config = crate::config::load_config(&config_path)?;
 
         if let Some(weights_path) = &config.weights_path {
-            eprintln!("[1/4] Checking TTS model weights...");
+            eprintln!("[1/{total_steps}] Checking TTS model weights...");
             crate::weights::download_if_necessary(weights_path)?;
         }
 
         // 2. Tokenizer
-        eprintln!("[2/4] Checking tokenizer...");
+        eprintln!("[2/{total_steps}] Checking tokenizer...");
         crate::weights::download_if_necessary(&config.flow_lm.lookup_table.tokenizer_path)?;
 
         // 3. ALL voice embeddings
-        eprintln!("[3/4] Checking voice embeddings...");
+        eprintln!("[3/{total_steps}] Checking voice embeddings...");
         for voice_name in voices {
             eprintln!("  - {}", voice_name);
             let voice_path = format!(
@@ -1179,9 +1200,11 @@ impl TTSModel {
             crate::weights::download_if_necessary(&voice_path)?;
         }
 
-        // 4. ONNX alignment model (wav2vec2-large INT8)
-        eprintln!("[4/4] Checking alignment model (ONNX wav2vec2)...");
-        crate::alignment::NativeAligner::preload_models()?;
+        // 4. ONNX alignment model (wav2vec2-large INT8) — optional
+        if word_timestamps {
+            eprintln!("[4/{total_steps}] Checking alignment model (ONNX wav2vec2)...");
+            crate::alignment::NativeAligner::preload_models()?;
+        }
 
         eprintln!("All models ready.");
         Ok(())
@@ -1205,32 +1228,37 @@ impl TTSModel {
 
     /// Generate audio for a single sentence with word timestamps.
     /// No internal text splitting -- caller controls chunking.
+    ///
+    /// If the alignment model is not loaded (no aligner), `word_timestamps`
+    /// will be empty — the caller handles sentence-level highlighting itself.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn generate_sentence_with_timestamps(
         &self,
         sentence: &str,
         voice_state: &ModelState,
     ) -> Result<GenerationResult> {
-        let aligner = self.aligner.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Alignment model not loaded. Use load_with_alignment()"))?;
-
         let audio = self.generate(sentence, voice_state)?;
-        let word_timestamps = aligner.align(&audio, sentence)?;
+
+        let word_timestamps = if let Some(aligner) = self.aligner.as_ref() {
+            aligner.align(&audio, sentence)?
+        } else {
+            vec![]
+        };
 
         Ok(GenerationResult { audio, word_timestamps })
     }
 
     /// Generate audio with word timestamps for full text.
     /// Splits text into sentences internally, generates + aligns each.
+    ///
+    /// If the alignment model is not loaded (no aligner), `word_timestamps`
+    /// will be empty — the caller handles sentence-level highlighting itself.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn generate_with_timestamps(
         &self,
         text: &str,
         voice_state: &ModelState,
     ) -> Result<GenerationResult> {
-        let aligner = self.aligner.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Alignment model not loaded. Use load_with_alignment()"))?;
-
         let chunks = self.split_into_best_sentences(text);
 
         if chunks.is_empty() {
@@ -1244,10 +1272,13 @@ impl TTSModel {
         for chunk_text in &chunks {
             let audio = self.generate(chunk_text, voice_state)?;
 
-            let mut timestamps = aligner.align(&audio, chunk_text)?;
-            for ts in &mut timestamps {
-                ts.start_sec += cumulative_offset_sec;
-                ts.end_sec += cumulative_offset_sec;
+            if let Some(aligner) = self.aligner.as_ref() {
+                let mut timestamps = aligner.align(&audio, chunk_text)?;
+                for ts in &mut timestamps {
+                    ts.start_sec += cumulative_offset_sec;
+                    ts.end_sec += cumulative_offset_sec;
+                }
+                all_timestamps.extend(timestamps);
             }
 
             // Duration from actual sample count
@@ -1255,7 +1286,6 @@ impl TTSModel {
             cumulative_offset_sec += num_samples as f32 / self.sample_rate as f32;
 
             all_audio.push(audio);
-            all_timestamps.extend(timestamps);
         }
 
         let audio = if all_audio.len() == 1 {
